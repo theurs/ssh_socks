@@ -1,0 +1,1 @@
+go build -ldflags "-H=windowsgui -s -w" -o ssh_proxy.exe main.go
