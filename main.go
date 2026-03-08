@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -24,7 +25,7 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// --- Структуры и Глобальные переменные ---
+// --- Structures and Global Variables ---
 
 type Config struct {
 	User        string `json:"user"`
@@ -32,7 +33,38 @@ type Config struct {
 	SSHPort     string `json:"ssh_port"`
 	SocksPort   string `json:"socks_port"`
 	AutoConnect bool   `json:"auto_connect"`
+	Country     string `json:"country"`
 }
+
+var countries = []struct {
+	ID   string
+	Name string
+}{
+	{"direct", "🚀 Direct Connection (SSH)"},
+	{"us", "🇺🇸 USA (United States)"},
+	{"ca", "🇨🇦 Canada"},
+	{"de", "🇩🇪 Germany"},
+	{"nl", "🇳🇱 Netherlands"},
+	{"fr", "🇫🇷 France"},
+	{"gb", "🇬🇧 United Kingdom"},
+	{"jp", "🇯🇵 Japan"},
+	{"sg", "🇸🇬 Singapore"},
+	{"pl", "🇵🇱 Poland"},
+	{"fi", "🇫🇮 Finland"},
+	{"au", "🇦🇺 Australia"},
+	{"br", "🇧🇷 Brazil"},
+	{"in", "🇮🇳 India"},
+	{"it", "🇮🇹 Italy"},
+	{"es", "🇪🇸 Spain"},
+	{"se", "🇸🇪 Sweden"},
+	{"no", "🇳🇴 Norway"},
+	{"ch", "🇨🇭 Switzerland"},
+	{"ua", "🇺🇦 Ukraine"},
+	{"kr", "🇰🇷 South Korea"},
+	{"hk", "🇭🇰 Hong Kong"},
+}
+
+var countryMenuItems = make(map[string]*systray.MenuItem)
 
 var (
 	conf      Config
@@ -96,18 +128,37 @@ func main() {
 
 func onReady() {
 	systray.SetTitle("SSH Proxy")
-	mConnect = systray.AddMenuItem("Подключить", "Запустить прокси")
-	mDisconnect = systray.AddMenuItem("Отключить", "Остановить прокси")
-	mSettings := systray.AddMenuItem("Настроить", "Параметры соединения")
+	mConnect = systray.AddMenuItem("Connect", "Start proxy")
+	mDisconnect = systray.AddMenuItem("Disconnect", "Stop proxy")
 	systray.AddSeparator()
-	mQuit := systray.AddMenuItem("Выход", "Закрыть приложение")
+
+	mRoute := systray.AddMenuItem("Traffic Route", "Select exit country")
+	for _, c := range countries {
+		isChecked := conf.Country == c.ID
+		if conf.Country == "" && c.ID == "direct" {
+			isChecked = true
+		}
+
+		mItem := mRoute.AddSubMenuItemCheckbox(c.Name, "", isChecked)
+		countryMenuItems[c.ID] = mItem
+
+		go func(id string) {
+			for range mItem.ClickedCh {
+				handleCountryChange(id)
+			}
+		}(c.ID)
+	}
+
+	systray.AddSeparator()
+	mSettings := systray.AddMenuItem("Settings", "Connection parameters")
+	systray.AddSeparator()
+	mQuit := systray.AddMenuItem("Exit", "Close application")
 
 	registerWindowClass("SSHProxySettings", syscall.NewCallback(settingsWndProc))
 	registerWindowClass("SSHPassPrompt", syscall.NewCallback(passWndProc))
 
 	setState(StateDisconnected)
 
-	// Автостарт при запуске
 	if conf.AutoConnect && conf.Host != "" {
 		go startSSHLoop()
 	}
@@ -136,7 +187,130 @@ func onExit() {
 	stopSSH()
 }
 
-// --- Логика SSH и Ключей ---
+func handleCountryChange(newID string) {
+	confMutex.Lock()
+	oldID := conf.Country
+	if oldID == "" {
+		oldID = "direct"
+	}
+	conf.Country = newID
+	confMutex.Unlock()
+
+	for id, item := range countryMenuItems {
+		if id == newID {
+			item.Check()
+		} else {
+			item.Uncheck()
+		}
+	}
+
+	saveConfig()
+
+	if newID != "direct" {
+		systray.SetTooltip("Status: Checking Tor on server...")
+		err := checkAndInstallTor()
+		if err != nil {
+			showError("Server Error", "Tor not found and cannot be installed:\n"+err.Error())
+			handleCountryChange("direct")
+			return
+		}
+	}
+
+	loopMutex.Lock()
+	active := loopRunning
+	loopMutex.Unlock()
+	if active {
+		stopSSH()
+		go startSSHLoop()
+	}
+}
+
+func checkAndInstallTor() error {
+	confMutex.Lock()
+	user, host, port := conf.User, conf.Host, conf.SSHPort
+	confMutex.Unlock()
+
+	if host == "" {
+		return fmt.Errorf("please configure server connection first")
+	}
+
+	checkCmd := `if ! command -v tor >/dev/null 2>&1; then 
+		echo "Tor missing, attempting install...";
+		sudo apt-get update -qq && sudo apt-get install -y tor; 
+	fi && command -v tor`
+
+	args := []string{"-p", port, "-o", "StrictHostKeyChecking=no", fmt.Sprintf("%s@%s", user, host), checkCmd}
+	cmd := exec.Command("ssh", args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("Tor is not installed. Try running 'sudo apt install tor' on the server manually.\nError: %v\nOutput: %s", err, string(output))
+	}
+
+	return nil
+}
+
+func setupRemoteTor(countryCode string) error {
+	confMutex.Lock()
+	user, host, port := conf.User, conf.Host, conf.SSHPort
+	confMutex.Unlock()
+
+	remoteSocksPort := "9060"
+	script := fmt.Sprintf(`
+# Определяем абсолютный путь к дому
+H=$HOME
+CFG="$H/.ssh_proxy_torrc"
+PID="$H/.ssh_proxy_tor.pid"
+DATA="$H/.ssh_proxy_data"
+
+# 1. Жестко убиваем старый процесс, если файл PID существует
+if [ -f "$PID" ]; then
+    kill $(cat "$PID") > /dev/null 2>&1 || true
+    rm "$PID"
+fi
+
+# 2. На всякий случай убиваем всё, что слушает 9060 (наш порт)
+fuser -k %s/tcp > /dev/null 2>&1 || true
+
+# 3. Создаем чистую папку для данных
+mkdir -p "$DATA"
+
+# 4. Генерируем конфиг с АБСОЛЮТНЫМИ путями
+cat <<EOF > "$CFG"
+SocksPort 127.0.0.1:%s
+DataDirectory $DATA
+PidFile $PID
+ExitNodes {%s}
+StrictNodes 1
+EOF
+
+# 5. Запускаем
+nohup tor -f "$CFG" > "$DATA/tor.log" 2>&1 &
+
+# 6. Ждем готовности порта (до 20 секунд)
+for i in {1..20}; do
+    if ss -nlt | grep -q ":%s"; then
+        exit 0
+    fi
+    sleep 1
+done
+exit 1
+`, remoteSocksPort, remoteSocksPort, countryCode, remoteSocksPort)
+
+	args := []string{"-p", port, "-o", "StrictHostKeyChecking=no", fmt.Sprintf("%s@%s", user, host), "bash"}
+	cmd := exec.Command("ssh", args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	cmd.Stdin = strings.NewReader(script)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("Tor setup failed: %v\n%s", err, string(output))
+	}
+	return nil
+}
+
+// --- SSH and Keys Logic ---
 
 func ensureSSHKeys() (string, error) {
 	home, _ := os.UserHomeDir()
@@ -146,7 +320,6 @@ func ensureSSHKeys() (string, error) {
 
 	if _, err := os.Stat(pubKey); os.IsNotExist(err) {
 		os.MkdirAll(sshDir, 0700)
-		// Генерируем ключ без пароля
 		cmd := exec.Command("ssh-keygen", "-t", "rsa", "-b", "2048", "-N", "", "-f", privKey)
 		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 		if err := cmd.Run(); err != nil {
@@ -162,23 +335,20 @@ func uploadKeyToServer(pubKey string) error {
 	user, host, port := conf.User, conf.Host, conf.SSHPort
 	confMutex.Unlock()
 
-	// 1. Пробуем зайти без пароля (проверка, есть ли уже ключ на сервере)
 	check := exec.Command("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-p", port, fmt.Sprintf("%s@%s", user, host), "exit")
 	check.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	if err := check.Run(); err == nil {
-		return nil // Ключ уже принят сервером
+		return nil
 	}
 
-	// 2. Если не пустило, запрашиваем пароль через наше WinAPI окно
 	tempPassword = ""
 	go showPasswordPrompt()
-	<-passDone // Ждем закрытия окна пароля
+	<-passDone
 
 	if tempPassword == "" {
-		return fmt.Errorf("авторизация отменена пользователем")
+		return fmt.Errorf("authentication cancelled by user")
 	}
 
-	// 3. Подключаемся через библиотеку Go SSH, чтобы забросить ключ (т.к. ssh.exe не ест пароли из stdin легко)
 	sshConfig := &ssh.ClientConfig{
 		User:            user,
 		Auth:            []ssh.AuthMethod{ssh.Password(tempPassword)},
@@ -189,7 +359,7 @@ func uploadKeyToServer(pubKey string) error {
 	addr := net.JoinHostPort(host, port)
 	client, err := ssh.Dial("tcp", addr, sshConfig)
 	if err != nil {
-		return fmt.Errorf("ошибка пароля или сервера: %v", err)
+		return fmt.Errorf("password or server error: %v", err)
 	}
 	defer client.Close()
 
@@ -199,7 +369,6 @@ func uploadKeyToServer(pubKey string) error {
 	}
 	defer session.Close()
 
-	// Команда для добавления ключа в authorized_keys
 	setupCmd := fmt.Sprintf("mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '%s' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys", pubKey)
 	return session.Run(setupCmd)
 }
@@ -219,7 +388,6 @@ func startSSHLoop() {
 		loopMutex.Unlock()
 	}()
 
-	// Очищаем стоп-канал
 	select {
 	case <-stopChan:
 	default:
@@ -227,27 +395,48 @@ func startSSHLoop() {
 
 	pubKey, err := ensureSSHKeys()
 	if err != nil {
-		showError("Ошибка ключей", "Не удалось создать локальный SSH ключ: "+err.Error())
+		showError("Key Error", "Failed to create local SSH key: "+err.Error())
 		setState(StateError)
 		return
 	}
 
 	setState(StateDisconnected)
-	systray.SetTooltip("Статус: Проверка авторизации...")
+	systray.SetTooltip("Status: Checking authorization...")
 
 	if err := uploadKeyToServer(pubKey); err != nil {
-		showError("Ошибка SSH", "Не удалось авторизоваться на сервере: "+err.Error())
+		showError("SSH Error", "Failed to authorize on server: "+err.Error())
 		setState(StateError)
 		return
 	}
 
-	// Основной цикл туннеля
 	for {
 		confMutex.Lock()
 		c := conf
 		confMutex.Unlock()
 
-		args := []string{"-N", "-T", "-o", "ServerAliveInterval=60", "-o", "StrictHostKeyChecking=no", "-p", c.SSHPort, "-D", c.SocksPort, fmt.Sprintf("%s@%s", c.User, c.Host)}
+		if sshCmd != nil && sshCmd.Process != nil {
+			sshCmd.Process.Kill()
+		}
+		killProcessOnPort(c.SocksPort)
+		time.Sleep(500 * time.Millisecond)
+
+		var args []string
+
+		if c.Country == "direct" || c.Country == "" {
+			systray.SetTooltip("Status: Direct connection...")
+			args = []string{"-N", "-T", "-o", "ServerAliveInterval=60", "-o", "StrictHostKeyChecking=no", "-p", c.SSHPort, "-D", c.SocksPort, fmt.Sprintf("%s@%s", c.User, c.Host)}
+		} else {
+			systray.SetTooltip("Status: Starting Tor (" + c.Country + ")...")
+			if err := setupRemoteTor(c.Country); err != nil {
+				showError("Tor Error", err.Error())
+				setState(StateError)
+				return
+			}
+
+			systray.SetTooltip("Status: Tunnel via Tor (" + c.Country + ")...")
+			args = []string{"-N", "-T", "-o", "ServerAliveInterval=60", "-o", "StrictHostKeyChecking=no", "-p", c.SSHPort, "-L", c.SocksPort + ":127.0.0.1:9060", fmt.Sprintf("%s@%s", c.User, c.Host)}
+		}
+
 		sshCmd = exec.Command("ssh", args...)
 		sshCmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 
@@ -262,13 +451,9 @@ func startSSHLoop() {
 
 		select {
 		case <-stopChan:
-			if sshCmd.Process != nil {
-				sshCmd.Process.Kill()
-			}
 			return
 		case <-done:
 			setState(StateError)
-			// Пауза перед реконнектом
 			select {
 			case <-stopChan:
 				return
@@ -287,9 +472,49 @@ func stopSSH() {
 	if sshCmd != nil && sshCmd.Process != nil {
 		sshCmd.Process.Kill()
 	}
+
+	confMutex.Lock()
+	p := conf.SocksPort
+	h := conf.Host
+	user := conf.User
+	sshP := conf.SSHPort
+	country := conf.Country
+	confMutex.Unlock()
+
+	killProcessOnPort(p)
+
+	// Cleanup on server
+	if country != "direct" && country != "" && h != "" {
+		go func(u, host, port string) {
+			// Use PID file for targeted process termination
+			cleanup := `PID="$HOME/.ssh_proxy_tor.pid"; [ -f "$PID" ] && kill $(cat "$PID") && rm "$PID" || true`
+			c := exec.Command("ssh", "-p", port, "-o", "StrictHostKeyChecking=no", fmt.Sprintf("%s@%s", u, host), cleanup)
+			c.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+			c.Run()
+		}(user, h, sshP)
+	}
 }
 
-// --- WinAPI Окна ---
+func killProcessOnPort(port string) {
+	cmd := exec.Command("cmd", "/c", fmt.Sprintf("netstat -ano | findstr :%s", port))
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	out, _ := cmd.Output()
+
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) >= 5 && strings.Contains(fields[1], ":"+port) {
+			pid := fields[4]
+			if pid != "0" {
+				kill := exec.Command("taskkill", "/F", "/PID", pid)
+				kill.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+				kill.Run()
+			}
+		}
+	}
+}
+
+// --- WinAPI Windows ---
 
 func settingsWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 	switch msg {
@@ -305,7 +530,6 @@ func settingsWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 			confMutex.Unlock()
 			saveConfig()
 
-			// ПЕРЕЗАПУСК: убиваем старый SSH и запускаем новый цикл с новыми данными
 			stopSSH()
 			go startSSHLoop()
 
@@ -347,25 +571,25 @@ func showSettingsNative() {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	title, _ := syscall.UTF16PtrFromString("Настройки SSH Туннеля")
+	title, _ := syscall.UTF16PtrFromString("SSH Tunnel Settings")
 	class, _ := syscall.UTF16PtrFromString("SSHProxySettings")
 	hwnd, _, _ := procCreateWindow.Call(0, uintptr(unsafe.Pointer(class)), uintptr(unsafe.Pointer(title)), 0x00C00000|0x00080000, 200, 200, 360, 400, 0, 0, 0, 0)
 
 	hFont, _, _ := gdi32.NewProc("GetStockObject").Call(17)
 
-	addLabel(hwnd, "Пользователь (Remote User):", 15, 15, hFont)
+	addLabel(hwnd, "Remote User:", 15, 15, hFont)
 	hEdUser = addEdit(hwnd, conf.User, 15, 35, 315, hFont, 0)
 
-	addLabel(hwnd, "Хост (IP сервера):", 15, 75, hFont)
+	addLabel(hwnd, "Server Host (IP):", 15, 75, hFont)
 	hEdHost = addEdit(hwnd, conf.Host, 15, 95, 315, hFont, 0)
 
-	addLabel(hwnd, "SSH Порт:", 15, 135, hFont)
+	addLabel(hwnd, "SSH Port:", 15, 135, hFont)
 	hEdSSH = addEdit(hwnd, conf.SSHPort, 15, 155, 140, hFont, 0)
 
-	addLabel(hwnd, "SOCKS Порт (Локальный):", 185, 135, hFont)
+	addLabel(hwnd, "SOCKS Port (Local):", 185, 135, hFont)
 	hEdSocks = addEdit(hwnd, conf.SocksPort, 185, 155, 145, hFont, 0)
 
-	cbT, _ := syscall.UTF16PtrFromString("Запускать автоматически")
+	cbT, _ := syscall.UTF16PtrFromString("Auto-connect on startup")
 	cbC, _ := syscall.UTF16PtrFromString("BUTTON")
 	hCbAuto, _, _ = procCreateWindow.Call(0, uintptr(unsafe.Pointer(cbC)), uintptr(unsafe.Pointer(cbT)), 0x40000000|0x10000000|0x0003, 15, 210, 315, 25, hwnd, ID_CHECKBOX, 0, 0)
 	procSendMessage.Call(hCbAuto, WM_SETFONT, hFont, 1)
@@ -373,7 +597,7 @@ func showSettingsNative() {
 		procSendMessage.Call(hCbAuto, BM_SETCHECK, BST_CHECKED, 0)
 	}
 
-	btnT, _ := syscall.UTF16PtrFromString("Сохранить и Подключить")
+	btnT, _ := syscall.UTF16PtrFromString("Save and Connect")
 	btnC, _ := syscall.UTF16PtrFromString("BUTTON")
 	hBtn, _, _ := procCreateWindow.Call(0, uintptr(unsafe.Pointer(btnC)), uintptr(unsafe.Pointer(btnT)), 0x40000000|0x10000000|0x0001, 15, 270, 315, 45, hwnd, ID_BUTTON_SAVE, 0, 0)
 	procSendMessage.Call(hBtn, WM_SETFONT, hFont, 1)
@@ -386,15 +610,15 @@ func showPasswordPrompt() {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	title, _ := syscall.UTF16PtrFromString("Требуется пароль сервера")
+	title, _ := syscall.UTF16PtrFromString("Server Password Required")
 	class, _ := syscall.UTF16PtrFromString("SSHPassPrompt")
 	hwnd, _, _ := procCreateWindow.Call(0, uintptr(unsafe.Pointer(class)), uintptr(unsafe.Pointer(title)), 0x00C00000|0x00080000, 300, 300, 350, 180, 0, 0, 0, 0)
 
 	hFont, _, _ := gdi32.NewProc("GetStockObject").Call(17)
-	addLabel(hwnd, "Введите пароль для установки SSH-ключа:", 15, 15, hFont)
+	addLabel(hwnd, "Enter password to install SSH key:", 15, 15, hFont)
 	hPassEdit = addEdit(hwnd, "", 15, 40, 300, hFont, ES_PASSWORD)
 
-	btnT, _ := syscall.UTF16PtrFromString("Подтвердить")
+	btnT, _ := syscall.UTF16PtrFromString("Confirm")
 	btnC, _ := syscall.UTF16PtrFromString("BUTTON")
 	hBtn, _, _ := procCreateWindow.Call(0, uintptr(unsafe.Pointer(btnC)), uintptr(unsafe.Pointer(btnT)), 0x40000000|0x10000000, 15, 80, 300, 40, hwnd, ID_BUTTON_PASS, 0, 0)
 	procSendMessage.Call(hBtn, WM_SETFONT, hFont, 1)
@@ -403,7 +627,7 @@ func showPasswordPrompt() {
 	messageLoop()
 }
 
-// --- Утилиты Интерфейса ---
+// --- UI Utilities ---
 
 func showError(title, text string) {
 	tPtr, _ := syscall.UTF16PtrFromString(title)
@@ -487,17 +711,17 @@ func setState(state int) {
 	switch state {
 	case StateDisconnected:
 		c = color.RGBA{130, 130, 130, 255}
-		tip = "SSH Proxy: Отключен"
+		tip = "SSH Proxy: Disconnected"
 		mConnect.Enable()
 		mDisconnect.Disable()
 	case StateConnected:
 		c = color.RGBA{0, 255, 120, 255}
-		tip = "SSH Proxy: Подключен"
+		tip = "SSH Proxy: Connected"
 		mConnect.Disable()
 		mDisconnect.Enable()
 	case StateError:
 		c = color.RGBA{255, 60, 60, 255}
-		tip = "SSH Proxy: Ошибка"
+		tip = "SSH Proxy: Error"
 		mConnect.Enable()
 		mDisconnect.Disable()
 	}
@@ -543,7 +767,7 @@ func loadConfig() {
 	if b, err := os.ReadFile(path); err == nil {
 		json.Unmarshal(b, &conf)
 	} else {
-		conf = Config{User: "ubuntu", Host: "", SSHPort: "22", SocksPort: "1080", AutoConnect: false}
+		conf = Config{User: "ubuntu", Host: "", SSHPort: "22", SocksPort: "1080", AutoConnect: false, Country: "direct"}
 	}
 }
 
