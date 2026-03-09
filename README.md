@@ -4,7 +4,9 @@
 
 **SSH Proxy** is a lightweight, high-performance Windows utility that transforms any remote SSH server into a versatile SOCKS5 gateway. It gives you the best of both worlds: use your server's raw IP for maximum speed, or route through a remote Tor instance for enhanced privacy—all toggleable from your system tray.
 
-![App Screenshot](./pics/pic1.png)
+![App Screenshot](./pics/2.png)
+![App Screenshot](./pics/1.png)
+![App Screenshot](./pics/3.png)
 
 ## 🌟 Key Features
 
