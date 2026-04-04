@@ -12,7 +12,7 @@ if not exist "dist\windows-amd64" mkdir "dist\windows-amd64"
 
 REM Build binary
 echo Building ssh_proxy...
-go build -ldflags "-H=windowsgui -s -w -X main.Version=!VERSION!" -o dist\windows-amd64\ssh_proxy.exe main.go
+go build -ldflags "-H=windowsgui -s -w -X main.Version=!VERSION!" -o dist\windows-amd64\ssh_proxy.exe .
 if !errorlevel! neq 0 (
     echo Error building ssh_proxy
     exit /b !errorlevel!

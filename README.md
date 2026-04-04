@@ -4,17 +4,20 @@
 
 **SSH Proxy** is a lightweight, high-performance Windows utility that transforms any remote SSH server into a versatile SOCKS5 gateway. It gives you the best of both worlds: use your server's raw IP for maximum speed, or route through a remote Tor instance for enhanced privacy—all toggleable from your system tray.
 
+**New: HTTP Proxy Support!** - In addition to SOCKS5, you can now enable a built-in HTTP proxy for applications that don't support SOCKS.
+
 ![App Screenshot](./pics/2.png)
 ![App Screenshot](./pics/1.png)
 ![App Screenshot](./pics/3.png)
 
 ## 🌟 Key Features
 
-- 🌍 **Multi-Country Tor Routing** — Choose from 20+ exit countries (US, DE, FR, JP, SG, etc.). Your traffic flows securely: `Local PC -> SSH Tunnel -> Remote Tor Instance -> World`.
+- 🌍 **Multi-Country Tor Routing** — Choose from 21+ exit countries (US, DE, FR, IL, JP, SG, etc.). Your traffic flows securely: `Local PC -> SSH Tunnel -> Remote Tor Instance -> World`.
 - 🚀 **Hybrid Connectivity** — Instantly switch between **Direct Mode** (standard SSH) and **Tor Mode** (anonymized routing) depending on your needs.
+- 🌐 **Built-in HTTP Proxy** — Enable an HTTP proxy alongside SOCKS5 for applications that don't support SOCKS. Fully configurable port.
 - 🛠️ **Zero-Touch Server Setup** — No manual config required. The app automatically detects Tor on your server, installs it if missing (Debian/Ubuntu), and spins up an isolated instance in your user's home directory—leaving system settings untouched.
 - 🔐 **Seamless Key Management** — Generates RSA keys locally and deploys them to your server automatically. You only need your password once.
-- 🖥️ **Native Windows Build** — Coded in Go using clean WinAPI. It’s tiny, fast, lives in your tray, and supports Windows Autostart.
+- 🖥️ **Native Windows Build** — Coded in Go using clean WinAPI. It's tiny, fast, lives in your tray, and supports Windows Autostart.
 - 🧹 **Automatic Cleanup** — When you disconnect, the app kills its remote Tor processes to keep your server lean and clutter-free.
 
 ## 🚀 How It Works
@@ -37,8 +40,11 @@
 
 1.  **Configure**: Right-click the tray icon → **Settings**. Enter your server credentials.
 2.  **Pick a Route**: Under the **Traffic Route** menu, select "Direct" or a specific country.
-3.  **Connect**: Click **Connect**. The tray icon will turn green once the tunnel is established.
-4.  **Proxy Setup**: Set your application's SOCKS5 proxy to `127.0.0.1:1080` (you can customize this port in Settings).
+3.  **HTTP Proxy (Optional)**: Check **Enable HTTP Proxy** in the tray menu if you need HTTP instead of SOCKS5.
+4.  **Connect**: Click **Connect**. The tray icon will turn green once the tunnel is established.
+5.  **Proxy Setup**: 
+    - **SOCKS5**: Set your application's SOCKS5 proxy to `127.0.0.1:1080` (you can customize this port in Settings).
+    - **HTTP**: Set your application's HTTP proxy to `127.0.0.1:8080` (configurable in Settings).
 
 ### Configuration Options
 
@@ -47,8 +53,10 @@
 | User | Remote SSH username (regular user recommended) | `ubuntu` |
 | Host | Server IP or Domain | — |
 | SSH Port | Remote SSH port | `22` |
-| SOCKS Port | Local proxy port for your PC | `1080` |
+| SOCKS Port | Local SOCKS5 proxy port for your PC | `1080` |
+| HTTP Port | Local HTTP proxy port for your PC | `8080` |
 | Autostart | Connect automatically on app launch | `false` |
+| HTTP Proxy | Enable HTTP proxy alongside SOCKS5 | `false` |
 
 ## 🏗️ Build from Source
 

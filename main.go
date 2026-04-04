@@ -10,6 +10,7 @@ import (
 	"image/draw"
 	"image/png"
 	"io/ioutil"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -34,13 +35,15 @@ type ServerProfile struct {
 	Host      string `json:"host"`
 	SSHPort   string `json:"ssh_port"`
 	SocksPort string `json:"socks_port"`
+	HttpPort  string `json:"http_port"`
 }
 
 type Config struct {
-	Profiles        []ServerProfile `json:"profiles"`
-	ActiveProfileID string          `json:"active_profile_id"`
-	AutoConnect     bool            `json:"auto_connect"`
-	Country         string          `json:"country"`
+	Profiles         []ServerProfile `json:"profiles"`
+	ActiveProfileID  string          `json:"active_profile_id"`
+	AutoConnect      bool            `json:"auto_connect"`
+	Country          string          `json:"country"`
+	HttpProxyEnabled bool            `json:"http_proxy_enabled"`
 
 	// Оставляем старые поля для обратной совместимости при миграции
 	User      string `json:"user,omitempty"`
@@ -64,6 +67,7 @@ var countries = []struct {
 	{"fr", "🇫🇷 France"},
 	{"gb", "🇬🇧 United Kingdom"},
 	{"hk", "🇭🇰 Hong Kong"},
+	{"il", "🇮🇱 Israel"},
 	{"in", "🇮🇳 India"},
 	{"it", "🇮🇹 Italy"},
 	{"jp", "🇯🇵 Japan"},
@@ -87,6 +91,7 @@ var (
 	passDone  = make(chan bool, 1)
 
 	mConnect, mDisconnect *systray.MenuItem
+	mHttpProxy            *systray.MenuItem // HTTP Proxy toggle
 
 	// WinAPI DLLs
 	user32   = syscall.NewLazyDLL("user32.dll")
@@ -112,17 +117,21 @@ var (
 	hEdUser, hEdHost, hEdSSH, hEdSocks, hCbAuto uintptr
 	hPassEdit                                   uintptr
 	hComboProfiles, hBtnAdd, hBtnDel, hEdName   uintptr
+	hEdHttp                                     uintptr // HTTP Proxy port field
 	tempPassword                                string
 	settingsOpen                                bool
 	loopRunning                                 bool
 	loopMutex                                   sync.Mutex
 
-	editProfiles []ServerProfile
+	editProfiles   []ServerProfile
 	editCurrentIdx int
 
-	mServers           *systray.MenuItem
-	serverMenuItems    = make(map[string]*systray.MenuItem)
+	mServers             *systray.MenuItem
+	serverMenuItems      = make(map[string]*systray.MenuItem)
 	activeRunningProfile *ServerProfile // Хранит профиль, который сейчас запущен
+
+	// HTTP Proxy
+	httpProxyServer *HttpProxy
 )
 
 const (
@@ -151,6 +160,7 @@ const (
 	ID_COMBO_PROFILES = 4
 	ID_BTN_ADD        = 5
 	ID_BTN_DEL        = 6
+	ID_BTN_HTTP       = 7 // Toggle HTTP proxy
 )
 
 func main() {
@@ -185,6 +195,8 @@ func onReady() {
 	}
 
 	systray.AddSeparator()
+	mHttpProxy = systray.AddMenuItemCheckbox("Enable HTTP Proxy", "Run HTTP proxy on configured port", conf.HttpProxyEnabled)
+	systray.AddSeparator()
 	mSettings := systray.AddMenuItem("Settings", "Connection parameters")
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("Exit", "Close application")
@@ -206,6 +218,8 @@ func onReady() {
 			case <-mDisconnect.ClickedCh:
 				stopSSH()
 				setState(StateDisconnected)
+			case <-mHttpProxy.ClickedCh:
+				handleHttpProxyToggle()
 			case <-mSettings.ClickedCh:
 				if !settingsOpen {
 					go showSettingsNative()
@@ -220,6 +234,38 @@ func onReady() {
 
 func onExit() {
 	stopSSH()
+}
+
+func handleHttpProxyToggle() {
+	if mHttpProxy.Checked() {
+		mHttpProxy.Uncheck()
+		// Stop HTTP proxy if running
+		if httpProxyServer != nil {
+			httpProxyServer.Stop()
+			httpProxyServer = nil
+		}
+		confMutex.Lock()
+		conf.HttpProxyEnabled = false
+		confMutex.Unlock()
+		saveConfig()
+	} else {
+		mHttpProxy.Check()
+		// Start HTTP proxy if SSH is connected
+		if activeRunningProfile != nil && activeRunningProfile.HttpPort != "" {
+			socksAddr := net.JoinHostPort("127.0.0.1", activeRunningProfile.SocksPort)
+			httpAddr := net.JoinHostPort("127.0.0.1", activeRunningProfile.HttpPort)
+			httpProxyServer = NewHttpProxy(httpAddr, socksAddr)
+			if err := httpProxyServer.Start(); err != nil {
+				showError("HTTP Proxy Error", "Failed to start HTTP proxy:\n"+err.Error())
+				mHttpProxy.Uncheck()
+			} else {
+				confMutex.Lock()
+				conf.HttpProxyEnabled = true
+				confMutex.Unlock()
+				saveConfig()
+			}
+		}
+	}
 }
 
 func rebuildServersMenu() {
@@ -561,6 +607,17 @@ func startSSHLoop() {
 		}
 
 		setState(StateConnected)
+
+		// Start HTTP proxy if enabled and port is configured
+		if conf.HttpProxyEnabled && activeRunningProfile.HttpPort != "" {
+			socksAddr := net.JoinHostPort("127.0.0.1", activeRunningProfile.SocksPort)
+			httpAddr := net.JoinHostPort("127.0.0.1", activeRunningProfile.HttpPort)
+			httpProxyServer = NewHttpProxy(httpAddr, socksAddr)
+			if err := httpProxyServer.Start(); err != nil {
+				log.Printf("[HTTP Proxy] Warning: Failed to start HTTP proxy: %v", err)
+			}
+		}
+
 		done := make(chan error, 1)
 		go func() { done <- sshCmd.Wait() }()
 
@@ -584,6 +641,13 @@ func stopSSH() {
 	case stopChan <- true:
 	default:
 	}
+
+	// Stop HTTP proxy
+	if httpProxyServer != nil {
+		httpProxyServer.Stop()
+		httpProxyServer = nil
+	}
+
 	if sshCmd != nil && sshCmd.Process != nil {
 		sshCmd.Process.Kill()
 	}
@@ -654,6 +718,7 @@ func settingsWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 				User:      "ubuntu",
 				SSHPort:   "22",
 				SocksPort: "1080",
+				HttpPort:  "8080",
 			}
 			editProfiles = append(editProfiles, newProf)
 			editCurrentIdx = len(editProfiles) - 1
@@ -685,6 +750,7 @@ func settingsWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 			}
 			res, _, _ := procSendMessage.Call(hCbAuto, BM_GETCHECK, 0, 0)
 			conf.AutoConnect = (res == BST_CHECKED)
+			conf.HttpProxyEnabled = mHttpProxy.Checked()
 			confMutex.Unlock()
 			saveConfig()
 
@@ -752,8 +818,8 @@ func showSettingsNative() {
 
 	title, _ := syscall.UTF16PtrFromString("SSH Tunnel Settings")
 	class, _ := syscall.UTF16PtrFromString("SSHProxySettings")
-	// Окно стало чуть выше (480 вместо 400)
-	hwnd, _, _ := procCreateWindow.Call(0, uintptr(unsafe.Pointer(class)), uintptr(unsafe.Pointer(title)), 0x00C00000|0x00080000, 200, 200, 360, 480, 0, 0, 0, 0)
+	// Окно стало чуть выше (520 вместо 480) для HTTP порта
+	hwnd, _, _ := procCreateWindow.Call(0, uintptr(unsafe.Pointer(class)), uintptr(unsafe.Pointer(title)), 0x00C00000|0x00080000, 200, 200, 360, 520, 0, 0, 0, 0)
 	hFont, _, _ := gdi32.NewProc("GetStockObject").Call(17)
 
 	// Блок профилей
@@ -786,19 +852,22 @@ func showSettingsNative() {
 	addLabel(hwnd, "SOCKS Port:", 185, 240, hFont)
 	hEdSocks = addEdit(hwnd, "", 185, 260, 145, hFont, 0)
 
+	addLabel(hwnd, "HTTP Port:", 15, 295, hFont)
+	hEdHttp = addEdit(hwnd, "", 15, 315, 140, hFont, 0)
+
 	refreshComboBox()
 	loadCurrentProfileToEdits()
 
 	// Глобальные настройки
 	cbT, _ := syscall.UTF16PtrFromString("Auto-connect on startup")
-	hCbAuto, _, _ = procCreateWindow.Call(0, uintptr(unsafe.Pointer(btnC)), uintptr(unsafe.Pointer(cbT)), 0x40000000|0x10000000|0x0003, 15, 310, 315, 25, hwnd, ID_CHECKBOX, 0, 0)
+	hCbAuto, _, _ = procCreateWindow.Call(0, uintptr(unsafe.Pointer(btnC)), uintptr(unsafe.Pointer(cbT)), 0x40000000|0x10000000|0x0003, 15, 355, 315, 25, hwnd, ID_CHECKBOX, 0, 0)
 	procSendMessage.Call(hCbAuto, WM_SETFONT, hFont, 1)
 	if autoConn {
 		procSendMessage.Call(hCbAuto, BM_SETCHECK, BST_CHECKED, 0)
 	}
 
 	btnT, _ := syscall.UTF16PtrFromString("Save and Connect")
-	hBtn, _, _ := procCreateWindow.Call(0, uintptr(unsafe.Pointer(btnC)), uintptr(unsafe.Pointer(btnT)), 0x40000000|0x10000000|0x0001, 15, 360, 315, 45, hwnd, ID_BUTTON_SAVE, 0, 0)
+	hBtn, _, _ := procCreateWindow.Call(0, uintptr(unsafe.Pointer(btnC)), uintptr(unsafe.Pointer(btnT)), 0x40000000|0x10000000|0x0001, 15, 405, 315, 45, hwnd, ID_BUTTON_SAVE, 0, 0)
 	procSendMessage.Call(hBtn, WM_SETFONT, hFont, 1)
 
 	procShowWindow.Call(hwnd, 1)
@@ -897,6 +966,7 @@ func saveEditsToCurrentProfile() {
 		editProfiles[editCurrentIdx].Host = getWinText(hEdHost)
 		editProfiles[editCurrentIdx].SSHPort = getWinText(hEdSSH)
 		editProfiles[editCurrentIdx].SocksPort = getWinText(hEdSocks)
+		editProfiles[editCurrentIdx].HttpPort = getWinText(hEdHttp)
 	}
 }
 
@@ -908,12 +978,14 @@ func loadCurrentProfileToEdits() {
 		setWinText(hEdHost, p.Host)
 		setWinText(hEdSSH, p.SSHPort)
 		setWinText(hEdSocks, p.SocksPort)
+		setWinText(hEdHttp, p.HttpPort)
 	} else {
 		setWinText(hEdName, "")
 		setWinText(hEdUser, "")
 		setWinText(hEdHost, "")
 		setWinText(hEdSSH, "")
 		setWinText(hEdSocks, "")
+		setWinText(hEdHttp, "8080")
 	}
 }
 
@@ -1021,6 +1093,7 @@ func loadConfig() {
 			Host:      conf.Host,
 			SSHPort:   conf.SSHPort,
 			SocksPort: conf.SocksPort,
+			HttpPort:  "8080",
 		}
 		conf.Profiles = append(conf.Profiles, newProf)
 		conf.ActiveProfileID = newProf.ID
@@ -1028,6 +1101,13 @@ func loadConfig() {
 		// Очищаем старые поля
 		conf.Host, conf.User, conf.SSHPort, conf.SocksPort = "", "", "", ""
 		saveConfig()
+	}
+
+	// Миграция: добавить HttpPort в существующие профили, если его нет
+	for i := range conf.Profiles {
+		if conf.Profiles[i].HttpPort == "" {
+			conf.Profiles[i].HttpPort = "8080"
+		}
 	}
 }
 
