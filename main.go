@@ -9,7 +9,7 @@ import (
 	"image/color"
 	"image/draw"
 	"image/png"
-	"io/ioutil"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -132,6 +132,9 @@ var (
 
 	// HTTP Proxy
 	httpProxyServer *HttpProxy
+
+	// Синглтон — мьютекс Windows
+	singletonHandle syscall.Handle
 )
 
 const (
@@ -164,8 +167,138 @@ const (
 )
 
 func main() {
+	// Копируем себя в temp, чтобы оригинальный файл не был заблокирован
+	runFromTemp()
+
+	// Синглтон
+	if !ensureSingleton() {
+		os.Exit(0)
+	}
+
 	loadConfig()
 	systray.Run(onReady, onExit)
+}
+
+// runFromTemp копирует текущий exe в TEMP и перезапускает оттуда.
+func runFromTemp() {
+	const envMarker = "SSH_SOCKS_RUN_FROM_TEMP"
+	if os.Getenv(envMarker) == "1" {
+		return
+	}
+
+	exePath, err := os.Executable()
+	if err != nil {
+		return
+	}
+	tempDir := os.TempDir()
+	if strings.HasPrefix(strings.ToLower(exePath), strings.ToLower(tempDir)) {
+		return
+	}
+
+	src, err := os.Open(exePath)
+	if err != nil {
+		return
+	}
+	defer src.Close()
+
+	dstPath := filepath.Join(tempDir, "ssh_socks.exe")
+	dst, err := os.Create(dstPath)
+	if err != nil {
+		return
+	}
+
+	_, err = io.Copy(dst, src)
+	dst.Close()
+	if err != nil {
+		os.Remove(dstPath)
+		return
+	}
+
+	cmd := exec.Command(dstPath, os.Args[1:]...)
+	cmd.Env = append(os.Environ(), envMarker+"=1")
+	if err := cmd.Start(); err != nil {
+		os.Remove(dstPath)
+		return
+	}
+
+	time.Sleep(500 * time.Millisecond)
+	os.Exit(0)
+}
+
+// ensureSingleton проверяет, запущен ли уже экземпляр через Windows Mutex.
+func ensureSingleton() bool {
+	name, _ := syscall.UTF16PtrFromString("Global\\ssh_socks_single_instance_mutex")
+	h, _, err := syscall.SyscallN(
+		kernel32.NewProc("CreateMutexW").Addr(),
+		0, // security attributes
+		1, // initial owner
+		uintptr(unsafe.Pointer(name)),
+	)
+	if h == 0 {
+		return true
+	}
+
+	singletonHandle = syscall.Handle(h)
+
+	if err == syscall.ERROR_ALREADY_EXISTS {
+		killExisting()
+
+		h2, _, _ := syscall.SyscallN(
+			kernel32.NewProc("OpenMutexW").Addr(),
+			uintptr(0x00100000), // MUTEX_ALL_ACCESS
+			1,                   // inherit
+			uintptr(unsafe.Pointer(name)),
+		)
+		if h2 != 0 {
+			syscall.SyscallN(kernel32.NewProc("CloseHandle").Addr(), uintptr(h2))
+		}
+
+		return false
+	}
+
+	return true
+}
+
+// closeSingleton закрывает синглтон
+func closeSingleton() {
+	if singletonHandle != 0 {
+		syscall.SyscallN(kernel32.NewProc("ReleaseMutex").Addr(), uintptr(singletonHandle))
+		syscall.SyscallN(kernel32.NewProc("CloseHandle").Addr(), uintptr(singletonHandle))
+		singletonHandle = 0
+	}
+}
+
+// killExisting ищет и убивает процессы ssh_socks.exe (кроме текущего)
+func killExisting() {
+	currentPID := os.Getpid()
+
+	cmd := exec.Command("tasklist", "/FI", "IMAGENAME eq ssh_socks.exe", "/FO", "CSV", "/NH")
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	out, err := cmd.Output()
+	if err != nil {
+		return
+	}
+
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		fields := strings.Split(line, ",")
+		if len(fields) < 2 {
+			continue
+		}
+		pidStr := strings.Trim(fields[1], "\" ")
+		var pid int
+		fmt.Sscanf(pidStr, "%d", &pid)
+		if pid <= 0 || pid == currentPID {
+			continue
+		}
+
+		proc, err := os.FindProcess(pid)
+		if err == nil {
+			proc.Kill()
+		}
+	}
+
+	time.Sleep(500 * time.Millisecond)
 }
 
 func onReady() {
@@ -196,6 +329,7 @@ func onReady() {
 
 	systray.AddSeparator()
 	mHttpProxy = systray.AddMenuItemCheckbox("Enable HTTP Proxy", "Run HTTP proxy on configured port", conf.HttpProxyEnabled)
+
 	systray.AddSeparator()
 	mSettings := systray.AddMenuItem("Settings", "Connection parameters")
 	systray.AddSeparator()
@@ -234,12 +368,12 @@ func onReady() {
 
 func onExit() {
 	stopSSH()
+	closeSingleton()
 }
 
 func handleHttpProxyToggle() {
 	if mHttpProxy.Checked() {
 		mHttpProxy.Uncheck()
-		// Stop HTTP proxy if running
 		if httpProxyServer != nil {
 			httpProxyServer.Stop()
 			httpProxyServer = nil
@@ -250,7 +384,6 @@ func handleHttpProxyToggle() {
 		saveConfig()
 	} else {
 		mHttpProxy.Check()
-		// Start HTTP proxy if SSH is connected
 		if activeRunningProfile != nil && activeRunningProfile.HttpPort != "" {
 			socksAddr := net.JoinHostPort("127.0.0.1", activeRunningProfile.SocksPort)
 			httpAddr := net.JoinHostPort("127.0.0.1", activeRunningProfile.HttpPort)
@@ -469,7 +602,7 @@ func ensureSSHKeys() (string, error) {
 			return "", err
 		}
 	}
-	content, err := ioutil.ReadFile(pubKey)
+	content, err := os.ReadFile(pubKey)
 	return string(content), err
 }
 
@@ -943,14 +1076,15 @@ func addLabel(p uintptr, t string, x, y int, f uintptr) {
 func addEdit(p uintptr, t string, x, y, w int, f uintptr, style uint32) uintptr {
 	tP, _ := syscall.UTF16PtrFromString(t)
 	cP, _ := syscall.UTF16PtrFromString("EDIT")
-	h, _, _ := procCreateWindow.Call(0x00000200, uintptr(unsafe.Pointer(cP)), uintptr(unsafe.Pointer(tP)), 0x40000000|0x10000000|0x00800000|uintptr(style), uintptr(x), uintptr(y), uintptr(w), 25, p, 0, 0, 0)
+	// 0x80 = ES_AUTOHSCROLL — горизонтальная прокрутка без ограничений длины
+	h, _, _ := procCreateWindow.Call(0x00000200, uintptr(unsafe.Pointer(cP)), uintptr(unsafe.Pointer(tP)), 0x40000000|0x10000000|0x00800000|uintptr(style)|0x80, uintptr(x), uintptr(y), uintptr(w), 25, p, 0, 0, 0)
 	procSendMessage.Call(h, WM_SETFONT, f, 1)
 	return h
 }
 
 func getWinText(h uintptr) string {
-	buf := make([]uint16, 256)
-	procGetWinText.Call(h, uintptr(unsafe.Pointer(&buf[0])), 256)
+	buf := make([]uint16, 32767)
+	procGetWinText.Call(h, uintptr(unsafe.Pointer(&buf[0])), 32767)
 	return syscall.UTF16ToString(buf)
 }
 
