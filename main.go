@@ -10,7 +10,6 @@ import (
 	"image/draw"
 	"image/png"
 	"io"
-	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -29,13 +28,14 @@ import (
 // --- Structures and Global Variables ---
 
 type ServerProfile struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	User      string `json:"user"`
-	Host      string `json:"host"`
-	SSHPort   string `json:"ssh_port"`
-	SocksPort string `json:"socks_port"`
-	HttpPort  string `json:"http_port"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	User        string `json:"user"`
+	Host        string `json:"host"`
+	SSHPort     string `json:"ssh_port"`
+	SocksPort   string `json:"socks_port"`
+	HTTPPort    string `json:"http_port"`
+	BindAddress string `json:"bind_address"`
 }
 
 type Config struct {
@@ -43,13 +43,11 @@ type Config struct {
 	ActiveProfileID  string          `json:"active_profile_id"`
 	AutoConnect      bool            `json:"auto_connect"`
 	Country          string          `json:"country"`
-	HttpProxyEnabled bool            `json:"http_proxy_enabled"`
-
-	// Оставляем старые поля для обратной совместимости при миграции
-	User      string `json:"user,omitempty"`
-	Host      string `json:"host,omitempty"`
-	SSHPort   string `json:"ssh_port,omitempty"`
-	SocksPort string `json:"socks_port,omitempty"`
+	HTTPProxyEnabled bool            `json:"http_proxy_enabled"`
+	User             string          `json:"user,omitempty"`
+	Host             string          `json:"host,omitempty"`
+	SSHPort          string          `json:"ssh_port,omitempty"`
+	SocksPort        string          `json:"socks_port,omitempty"`
 }
 
 var countries = []struct {
@@ -91,14 +89,12 @@ var (
 	passDone  = make(chan bool, 1)
 
 	mConnect, mDisconnect *systray.MenuItem
-	mHttpProxy            *systray.MenuItem // HTTP Proxy toggle
+	mHTTPProxy            *systray.MenuItem
 
-	// WinAPI DLLs
 	user32   = syscall.NewLazyDLL("user32.dll")
 	kernel32 = syscall.NewLazyDLL("kernel32.dll")
 	gdi32    = syscall.NewLazyDLL("gdi32.dll")
 
-	// WinAPI Procedures
 	procCreateWindow  = user32.NewProc("CreateWindowExW")
 	procDefWinProc    = user32.NewProc("DefWindowProcW")
 	procRegisterClass = user32.NewProc("RegisterClassExW")
@@ -113,11 +109,11 @@ var (
 	procMessageBox    = user32.NewProc("MessageBoxW")
 	procSetWindowText = user32.NewProc("SetWindowTextW")
 
-	// Window Handles
 	hEdUser, hEdHost, hEdSSH, hEdSocks, hCbAuto uintptr
 	hPassEdit                                   uintptr
 	hComboProfiles, hBtnAdd, hBtnDel, hEdName   uintptr
-	hEdHttp                                     uintptr // HTTP Proxy port field
+	hEdHTTP                                     uintptr
+	hEdBind                                     uintptr
 	tempPassword                                string
 	settingsOpen                                bool
 	loopRunning                                 bool
@@ -128,12 +124,10 @@ var (
 
 	mServers             *systray.MenuItem
 	serverMenuItems      = make(map[string]*systray.MenuItem)
-	activeRunningProfile *ServerProfile // Хранит профиль, который сейчас запущен
+	activeRunningProfile *ServerProfile
 
-	// HTTP Proxy
-	httpProxyServer *HttpProxy
+	httpProxyServer *HTTPProxy
 
-	// Синглтон — мьютекс Windows
 	singletonHandle syscall.Handle
 )
 
@@ -142,35 +136,33 @@ const (
 	StateConnected
 	StateError
 
-	WM_COMMAND  = 0x0111
-	WM_DESTROY  = 0x0002
-	WM_SETFONT  = 0x0030
-	BM_GETCHECK = 0x00F0
-	BM_SETCHECK = 0x00F1
-	BST_CHECKED = 0x0001
-	ES_PASSWORD = 0x0020
+	WmCommand  = 0x0111
+	WmDestroy  = 0x0002
+	WmSetFont  = 0x0030
+	BmGetCheck = 0x00F0
+	BmSetCheck = 0x00F1
+	BstChecked = 0x0001
+	EsPassword = 0x0020
 
-	CBS_DROPDOWNLIST = 0x0003
-	CBN_SELCHANGE    = 1
-	CB_ADDSTRING     = 0x0143
-	CB_SETCURSEL     = 0x014E
-	CB_GETCURSEL     = 0x0147
-	CB_RESETCONTENT  = 0x014B
+	CbsDropdownList = 0x0003
+	CbnSelChange    = 1
+	CbAddString     = 0x0143
+	CbSetCursel     = 0x014E
+	CbGetCursel     = 0x0147
+	CbResetContent  = 0x014B
 
-	ID_BUTTON_SAVE    = 1
-	ID_BUTTON_PASS    = 2
-	ID_CHECKBOX       = 3
-	ID_COMBO_PROFILES = 4
-	ID_BTN_ADD        = 5
-	ID_BTN_DEL        = 6
-	ID_BTN_HTTP       = 7 // Toggle HTTP proxy
+	IDButtonSave    = 1
+	IDButtonPass    = 2
+	IDCheckbox      = 3
+	IDComboProfiles = 4
+	IDBtnAdd        = 5
+	IDBtnDel        = 6
+	IDBtnHTTP       = 7
 )
 
 func main() {
-	// Копируем себя в temp, чтобы оригинальный файл не был заблокирован
 	runFromTemp()
 
-	// Синглтон
 	if !ensureSingleton() {
 		os.Exit(0)
 	}
@@ -179,7 +171,6 @@ func main() {
 	systray.Run(onReady, onExit)
 }
 
-// runFromTemp копирует текущий exe в TEMP и перезапускает оттуда.
 func runFromTemp() {
 	const envMarker = "SSH_SOCKS_RUN_FROM_TEMP"
 	if os.Getenv(envMarker) == "1" {
@@ -225,13 +216,12 @@ func runFromTemp() {
 	os.Exit(0)
 }
 
-// ensureSingleton проверяет, запущен ли уже экземпляр через Windows Mutex.
 func ensureSingleton() bool {
 	name, _ := syscall.UTF16PtrFromString("Global\\ssh_socks_single_instance_mutex")
 	h, _, err := syscall.SyscallN(
 		kernel32.NewProc("CreateMutexW").Addr(),
-		0, // security attributes
-		1, // initial owner
+		0,
+		1,
 		uintptr(unsafe.Pointer(name)),
 	)
 	if h == 0 {
@@ -242,24 +232,20 @@ func ensureSingleton() bool {
 
 	if err == syscall.ERROR_ALREADY_EXISTS {
 		killExisting()
-
 		h2, _, _ := syscall.SyscallN(
 			kernel32.NewProc("OpenMutexW").Addr(),
-			uintptr(0x00100000), // MUTEX_ALL_ACCESS
-			1,                   // inherit
+			uintptr(0x00100000),
+			1,
 			uintptr(unsafe.Pointer(name)),
 		)
 		if h2 != 0 {
 			syscall.SyscallN(kernel32.NewProc("CloseHandle").Addr(), uintptr(h2))
 		}
-
 		return false
 	}
-
 	return true
 }
 
-// closeSingleton закрывает синглтон
 func closeSingleton() {
 	if singletonHandle != 0 {
 		syscall.SyscallN(kernel32.NewProc("ReleaseMutex").Addr(), uintptr(singletonHandle))
@@ -268,10 +254,8 @@ func closeSingleton() {
 	}
 }
 
-// killExisting ищет и убивает процессы ssh_socks.exe (кроме текущего)
 func killExisting() {
 	currentPID := os.Getpid()
-
 	cmd := exec.Command("tasklist", "/FI", "IMAGENAME eq ssh_socks.exe", "/FO", "CSV", "/NH")
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	out, err := cmd.Output()
@@ -291,13 +275,11 @@ func killExisting() {
 		if pid <= 0 || pid == currentPID {
 			continue
 		}
-
 		proc, err := os.FindProcess(pid)
 		if err == nil {
 			proc.Kill()
 		}
 	}
-
 	time.Sleep(500 * time.Millisecond)
 }
 
@@ -316,10 +298,8 @@ func onReady() {
 		if conf.Country == "" && c.ID == "direct" {
 			isChecked = true
 		}
-
 		mItem := mRoute.AddSubMenuItemCheckbox(c.Name, "", isChecked)
 		countryMenuItems[c.ID] = mItem
-
 		go func(id string) {
 			for range mItem.ClickedCh {
 				handleCountryChange(id)
@@ -328,7 +308,7 @@ func onReady() {
 	}
 
 	systray.AddSeparator()
-	mHttpProxy = systray.AddMenuItemCheckbox("Enable HTTP Proxy", "Run HTTP proxy on configured port", conf.HttpProxyEnabled)
+	mHTTPProxy = systray.AddMenuItemCheckbox("Enable HTTP Proxy", "Run HTTP proxy on configured port", conf.HTTPProxyEnabled)
 
 	systray.AddSeparator()
 	mSettings := systray.AddMenuItem("Settings", "Connection parameters")
@@ -352,8 +332,8 @@ func onReady() {
 			case <-mDisconnect.ClickedCh:
 				stopSSH()
 				setState(StateDisconnected)
-			case <-mHttpProxy.ClickedCh:
-				handleHttpProxyToggle()
+			case <-mHTTPProxy.ClickedCh:
+				handleHTTPProxyToggle()
 			case <-mSettings.ClickedCh:
 				if !settingsOpen {
 					go showSettingsNative()
@@ -371,29 +351,33 @@ func onExit() {
 	closeSingleton()
 }
 
-func handleHttpProxyToggle() {
-	if mHttpProxy.Checked() {
-		mHttpProxy.Uncheck()
+func handleHTTPProxyToggle() {
+	if mHTTPProxy.Checked() {
+		mHTTPProxy.Uncheck()
 		if httpProxyServer != nil {
 			httpProxyServer.Stop()
 			httpProxyServer = nil
 		}
 		confMutex.Lock()
-		conf.HttpProxyEnabled = false
+		conf.HTTPProxyEnabled = false
 		confMutex.Unlock()
 		saveConfig()
 	} else {
-		mHttpProxy.Check()
-		if activeRunningProfile != nil && activeRunningProfile.HttpPort != "" {
-			socksAddr := net.JoinHostPort("127.0.0.1", activeRunningProfile.SocksPort)
-			httpAddr := net.JoinHostPort("127.0.0.1", activeRunningProfile.HttpPort)
-			httpProxyServer = NewHttpProxy(httpAddr, socksAddr)
+		mHTTPProxy.Check()
+		if activeRunningProfile != nil && activeRunningProfile.HTTPPort != "" {
+			bindAddr := activeRunningProfile.BindAddress
+			if bindAddr == "" {
+				bindAddr = "127.0.0.1"
+			}
+			socksAddr := net.JoinHostPort(bindAddr, activeRunningProfile.SocksPort)
+			httpAddr := net.JoinHostPort(bindAddr, activeRunningProfile.HTTPPort)
+			httpProxyServer = NewHTTPProxy(httpAddr, socksAddr)
 			if err := httpProxyServer.Start(); err != nil {
 				showError("HTTP Proxy Error", "Failed to start HTTP proxy:\n"+err.Error())
-				mHttpProxy.Uncheck()
+				mHTTPProxy.Uncheck()
 			} else {
 				confMutex.Lock()
-				conf.HttpProxyEnabled = true
+				conf.HTTPProxyEnabled = true
 				confMutex.Unlock()
 				saveConfig()
 			}
@@ -402,11 +386,9 @@ func handleHttpProxyToggle() {
 }
 
 func rebuildServersMenu() {
-	// Скрываем старые пункты
 	for _, item := range serverMenuItems {
 		item.Hide()
 	}
-
 	confMutex.Lock()
 	profiles := conf.Profiles
 	activeID := conf.ActiveProfileID
@@ -444,7 +426,6 @@ func setActiveServerFromTray(id string) {
 	conf.ActiveProfileID = id
 	confMutex.Unlock()
 	saveConfig()
-
 	rebuildServersMenu()
 
 	loopMutex.Lock()
@@ -473,7 +454,6 @@ func handleCountryChange(newID string) {
 			item.Uncheck()
 		}
 	}
-
 	saveConfig()
 
 	if newID != "direct" {
@@ -504,21 +484,17 @@ func checkAndInstallTor() error {
 		return fmt.Errorf("please configure a server profile first")
 	}
 	user, host, port := prof.User, prof.Host, prof.SSHPort
-
 	checkCmd := `if ! command -v tor >/dev/null 2>&1; then
 		echo "Tor missing, attempting install...";
 		sudo apt-get update -qq && sudo apt-get install -y tor;
 	fi && command -v tor`
-
 	args := []string{"-p", port, "-o", "StrictHostKeyChecking=no", fmt.Sprintf("%s@%s", user, host), checkCmd}
 	cmd := exec.Command("ssh", args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("Tor is not installed. Try running 'sudo apt install tor' on the server manually.\nError: %v\nOutput: %s", err, string(output))
+		return fmt.Errorf("tor installation failed: %v\nOutput: %s", err, string(output))
 	}
-
 	return nil
 }
 
@@ -531,28 +507,18 @@ func setupRemoteTor(countryCode string) error {
 		return fmt.Errorf("please configure a server profile first")
 	}
 	user, host, port := prof.User, prof.Host, prof.SSHPort
-
 	remoteSocksPort := "9060"
 	script := fmt.Sprintf(`
-# Определяем абсолютный путь к дому
 H=$HOME
 CFG="$H/.ssh_proxy_torrc"
 PID="$H/.ssh_proxy_tor.pid"
 DATA="$H/.ssh_proxy_data"
-
-# 1. Жестко убиваем старый процесс, если файл PID существует
 if [ -f "$PID" ]; then
     kill $(cat "$PID") > /dev/null 2>&1 || true
     rm "$PID"
 fi
-
-# 2. На всякий случай убиваем всё, что слушает 9060 (наш порт)
 fuser -k %s/tcp > /dev/null 2>&1 || true
-
-# 3. Создаем чистую папку для данных
 mkdir -p "$DATA"
-
-# 4. Генерируем конфиг с АБСОЛЮТНЫМИ путями
 cat <<EOF > "$CFG"
 SocksPort 127.0.0.1:%s
 DataDirectory $DATA
@@ -560,11 +526,7 @@ PidFile $PID
 ExitNodes {%s}
 StrictNodes 1
 EOF
-
-# 5. Запускаем
 nohup tor -f "$CFG" > "$DATA/tor.log" 2>&1 &
-
-# 6. Ждем готовности порта (до 20 секунд)
 for i in {1..20}; do
     if ss -nlt | grep -q ":%s"; then
         exit 0
@@ -578,22 +540,18 @@ exit 1
 	cmd := exec.Command("ssh", args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	cmd.Stdin = strings.NewReader(script)
-
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("Tor setup failed: %v\n%s", err, string(output))
+		return fmt.Errorf("tor setup failed: %v\n%s", err, string(output))
 	}
 	return nil
 }
-
-// --- SSH and Keys Logic ---
 
 func ensureSSHKeys() (string, error) {
 	home, _ := os.UserHomeDir()
 	sshDir := filepath.Join(home, ".ssh")
 	privKey := filepath.Join(sshDir, "id_rsa")
 	pubKey := privKey + ".pub"
-
 	if _, err := os.Stat(pubKey); os.IsNotExist(err) {
 		os.MkdirAll(sshDir, 0700)
 		cmd := exec.Command("ssh-keygen", "-t", "rsa", "-b", "2048", "-N", "", "-f", privKey)
@@ -615,7 +573,6 @@ func uploadKeyToServer(pubKey string) error {
 		return fmt.Errorf("please configure a server profile first")
 	}
 	user, host, port := prof.User, prof.Host, prof.SSHPort
-
 	check := exec.Command("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", "-p", port, fmt.Sprintf("%s@%s", user, host), "exit")
 	check.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	if err := check.Run(); err == nil {
@@ -625,9 +582,8 @@ func uploadKeyToServer(pubKey string) error {
 	tempPassword = ""
 	go showPasswordPrompt()
 	<-passDone
-
 	if tempPassword == "" {
-		return fmt.Errorf("authentication cancelled by user")
+		return fmt.Errorf("authentication cancelled")
 	}
 
 	sshConfig := &ssh.ClientConfig{
@@ -636,11 +592,10 @@ func uploadKeyToServer(pubKey string) error {
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         10 * time.Second,
 	}
-
 	addr := net.JoinHostPort(host, port)
 	client, err := ssh.Dial("tcp", addr, sshConfig)
 	if err != nil {
-		return fmt.Errorf("password or server error: %v", err)
+		return fmt.Errorf("dial error: %v", err)
 	}
 	defer client.Close()
 
@@ -674,36 +629,34 @@ func startSSHLoop() {
 	default:
 	}
 
-	// Берем активный профиль и сохраняем его как ТЕКУЩИЙ запущенный
 	confMutex.Lock()
 	prof := getActiveProfile()
 	country := conf.Country
 	if prof != nil {
 		activeRunningProfile = &ServerProfile{}
-		*activeRunningProfile = *prof // копируем
+		*activeRunningProfile = *prof
 	} else {
 		activeRunningProfile = nil
 	}
 	confMutex.Unlock()
 
 	if activeRunningProfile == nil || activeRunningProfile.Host == "" {
-		showError("Profile Error", "No active server configured.")
+		showError("Profile Error", "No active server.")
 		setState(StateError)
 		return
 	}
 
 	pubKey, err := ensureSSHKeys()
 	if err != nil {
-		showError("Key Error", "Failed to create local SSH key: "+err.Error())
+		showError("Key Error", err.Error())
 		setState(StateError)
 		return
 	}
 
 	setState(StateDisconnected)
 	systray.SetTooltip(fmt.Sprintf("Auth: %s...", activeRunningProfile.Name))
-
 	if err := uploadKeyToServer(pubKey); err != nil {
-		showError("SSH Error", "Failed to authorize on server: "+err.Error())
+		showError("SSH Error", err.Error())
 		setState(StateError)
 		return
 	}
@@ -716,10 +669,14 @@ func startSSHLoop() {
 		time.Sleep(500 * time.Millisecond)
 
 		var args []string
+		bindAddr := activeRunningProfile.BindAddress
+		if bindAddr == "" {
+			bindAddr = "127.0.0.1"
+		}
 
 		if country == "direct" || country == "" {
 			systray.SetTooltip(fmt.Sprintf("Direct: %s", activeRunningProfile.Name))
-			args = []string{"-N", "-T", "-o", "ServerAliveInterval=60", "-o", "StrictHostKeyChecking=no", "-p", activeRunningProfile.SSHPort, "-D", activeRunningProfile.SocksPort, fmt.Sprintf("%s@%s", activeRunningProfile.User, activeRunningProfile.Host)}
+			args = []string{"-N", "-T", "-o", "ServerAliveInterval=60", "-o", "StrictHostKeyChecking=no", "-p", activeRunningProfile.SSHPort, "-D", bindAddr + ":" + activeRunningProfile.SocksPort, fmt.Sprintf("%s@%s", activeRunningProfile.User, activeRunningProfile.Host)}
 		} else {
 			systray.SetTooltip(fmt.Sprintf("Starting Tor (%s) on %s...", country, activeRunningProfile.Name))
 			if err := setupRemoteTor(country); err != nil {
@@ -728,32 +685,26 @@ func startSSHLoop() {
 				return
 			}
 			systray.SetTooltip(fmt.Sprintf("Tor (%s): %s", country, activeRunningProfile.Name))
-			args = []string{"-N", "-T", "-o", "ServerAliveInterval=60", "-o", "StrictHostKeyChecking=no", "-p", activeRunningProfile.SSHPort, "-L", activeRunningProfile.SocksPort + ":127.0.0.1:9060", fmt.Sprintf("%s@%s", activeRunningProfile.User, activeRunningProfile.Host)}
+			args = []string{"-N", "-T", "-o", "ServerAliveInterval=60", "-o", "StrictHostKeyChecking=no", "-p", activeRunningProfile.SSHPort, "-L", bindAddr + ":" + activeRunningProfile.SocksPort + ":127.0.0.1:9060", fmt.Sprintf("%s@%s", activeRunningProfile.User, activeRunningProfile.Host)}
 		}
 
 		sshCmd = exec.Command("ssh", args...)
 		sshCmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-
 		if err := sshCmd.Start(); err != nil {
 			setState(StateError)
 			return
 		}
-
 		setState(StateConnected)
 
-		// Start HTTP proxy if enabled and port is configured
-		if conf.HttpProxyEnabled && activeRunningProfile.HttpPort != "" {
-			socksAddr := net.JoinHostPort("127.0.0.1", activeRunningProfile.SocksPort)
-			httpAddr := net.JoinHostPort("127.0.0.1", activeRunningProfile.HttpPort)
-			httpProxyServer = NewHttpProxy(httpAddr, socksAddr)
-			if err := httpProxyServer.Start(); err != nil {
-				log.Printf("[HTTP Proxy] Warning: Failed to start HTTP proxy: %v", err)
-			}
+		if conf.HTTPProxyEnabled && activeRunningProfile.HTTPPort != "" {
+			socksAddr := net.JoinHostPort(bindAddr, activeRunningProfile.SocksPort)
+			httpAddr := net.JoinHostPort(bindAddr, activeRunningProfile.HTTPPort)
+			httpProxyServer = NewHTTPProxy(httpAddr, socksAddr)
+			httpProxyServer.Start()
 		}
 
 		done := make(chan error, 1)
 		go func() { done <- sshCmd.Wait() }()
-
 		select {
 		case <-stopChan:
 			return
@@ -774,36 +725,26 @@ func stopSSH() {
 	case stopChan <- true:
 	default:
 	}
-
-	// Stop HTTP proxy
 	if httpProxyServer != nil {
 		httpProxyServer.Stop()
 		httpProxyServer = nil
 	}
-
 	if sshCmd != nil && sshCmd.Process != nil {
 		sshCmd.Process.Kill()
 	}
-
 	if activeRunningProfile != nil {
 		killProcessOnPort(activeRunningProfile.SocksPort)
-
 		confMutex.Lock()
 		country := conf.Country
 		confMutex.Unlock()
-
-		// Cleanup on server
 		if country != "direct" && country != "" && activeRunningProfile.Host != "" {
 			go func(u, host, port string) {
-				// Use PID file for targeted process termination
 				cleanup := `PID="$HOME/.ssh_proxy_tor.pid"; [ -f "$PID" ] && kill $(cat "$PID") && rm "$PID" || true`
 				c := exec.Command("ssh", "-p", port, "-o", "StrictHostKeyChecking=no", fmt.Sprintf("%s@%s", u, host), cleanup)
 				c.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 				c.Run()
 			}(activeRunningProfile.User, activeRunningProfile.Host, activeRunningProfile.SSHPort)
 		}
-
-		// Сбрасываем активный запущенный профиль
 		activeRunningProfile = nil
 	}
 }
@@ -812,7 +753,6 @@ func killProcessOnPort(port string) {
 	cmd := exec.Command("cmd", "/c", fmt.Sprintf("netstat -ano | findstr :%s", port))
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	out, _ := cmd.Output()
-
 	lines := strings.Split(string(out), "\n")
 	for _, line := range lines {
 		fields := strings.Fields(line)
@@ -827,31 +767,28 @@ func killProcessOnPort(port string) {
 	}
 }
 
-// --- WinAPI Windows ---
-
 func settingsWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 	switch msg {
-	case WM_COMMAND:
+	case WmCommand:
 		cmdID := wparam & 0xFFFF
 		cmdEvent := (wparam >> 16) & 0xFFFF
-
-		if cmdID == ID_COMBO_PROFILES && cmdEvent == CBN_SELCHANGE {
+		if cmdID == IDComboProfiles && cmdEvent == CbnSelChange {
 			saveEditsToCurrentProfile()
-			res, _, _ := procSendMessage.Call(hComboProfiles, CB_GETCURSEL, 0, 0)
+			res, _, _ := procSendMessage.Call(hComboProfiles, CbGetCursel, 0, 0)
 			editCurrentIdx = int(res)
 			loadCurrentProfileToEdits()
 			return 0
 		}
-
-		if cmdID == ID_BTN_ADD {
+		if cmdID == IDBtnAdd {
 			saveEditsToCurrentProfile()
 			newProf := ServerProfile{
-				ID:        fmt.Sprintf("%d", time.Now().UnixNano()),
-				Name:      "New Server",
-				User:      "ubuntu",
-				SSHPort:   "22",
-				SocksPort: "1080",
-				HttpPort:  "8080",
+				ID:          fmt.Sprintf("%d", time.Now().UnixNano()),
+				Name:        "New Server",
+				User:        "ubuntu",
+				SSHPort:     "22",
+				SocksPort:   "1080",
+				HTTPPort:    "8080",
+				BindAddress: "127.0.0.1",
 			}
 			editProfiles = append(editProfiles, newProf)
 			editCurrentIdx = len(editProfiles) - 1
@@ -859,8 +796,7 @@ func settingsWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 			loadCurrentProfileToEdits()
 			return 0
 		}
-
-		if cmdID == ID_BTN_DEL {
+		if cmdID == IDBtnDel {
 			if len(editProfiles) > 0 {
 				editProfiles = append(editProfiles[:editCurrentIdx], editProfiles[editCurrentIdx+1:]...)
 				if editCurrentIdx >= len(editProfiles) {
@@ -871,8 +807,7 @@ func settingsWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 			}
 			return 0
 		}
-
-		if cmdID == ID_BUTTON_SAVE {
+		if cmdID == IDButtonSave {
 			saveEditsToCurrentProfile()
 			confMutex.Lock()
 			conf.Profiles = editProfiles
@@ -881,14 +816,12 @@ func settingsWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 			} else {
 				conf.ActiveProfileID = ""
 			}
-			res, _, _ := procSendMessage.Call(hCbAuto, BM_GETCHECK, 0, 0)
-			conf.AutoConnect = (res == BST_CHECKED)
-			conf.HttpProxyEnabled = mHttpProxy.Checked()
+			res, _, _ := procSendMessage.Call(hCbAuto, BmGetCheck, 0, 0)
+			conf.AutoConnect = (res == BstChecked)
+			conf.HTTPProxyEnabled = mHTTPProxy.Checked()
 			confMutex.Unlock()
 			saveConfig()
-
 			rebuildServersMenu()
-
 			stopSSH()
 			if conf.ActiveProfileID != "" {
 				go startSSHLoop()
@@ -896,7 +829,7 @@ func settingsWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 			procDestroyWin.Call(hwnd)
 			return 0
 		}
-	case WM_DESTROY:
+	case WmDestroy:
 		settingsOpen = false
 		procPostQuitMsg.Call(0)
 	default:
@@ -908,13 +841,13 @@ func settingsWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 
 func passWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 	switch msg {
-	case WM_COMMAND:
-		if wparam == ID_BUTTON_PASS {
+	case WmCommand:
+		if wparam == IDButtonPass {
 			tempPassword = getWinText(hPassEdit)
 			passDone <- true
 			procDestroyWin.Call(hwnd)
 		}
-	case WM_DESTROY:
+	case WmDestroy:
 		select {
 		case passDone <- true:
 		default:
@@ -935,7 +868,6 @@ func showSettingsNative() {
 	confMutex.Lock()
 	editProfiles = make([]ServerProfile, len(conf.Profiles))
 	copy(editProfiles, conf.Profiles)
-
 	editCurrentIdx = -1
 	for i, p := range editProfiles {
 		if p.ID == conf.ActiveProfileID {
@@ -951,57 +883,50 @@ func showSettingsNative() {
 
 	title, _ := syscall.UTF16PtrFromString("SSH Tunnel Settings")
 	class, _ := syscall.UTF16PtrFromString("SSHProxySettings")
-	// Окно стало чуть выше (520 вместо 480) для HTTP порта
-	hwnd, _, _ := procCreateWindow.Call(0, uintptr(unsafe.Pointer(class)), uintptr(unsafe.Pointer(title)), 0x00C00000|0x00080000, 200, 200, 360, 520, 0, 0, 0, 0)
+	hwnd, _, _ := procCreateWindow.Call(0, uintptr(unsafe.Pointer(class)), uintptr(unsafe.Pointer(title)), 0x00C00000|0x00080000, 200, 200, 360, 540, 0, 0, 0, 0)
 	hFont, _, _ := gdi32.NewProc("GetStockObject").Call(17)
 
-	// Блок профилей
 	addLabel(hwnd, "Select Profile:", 15, 15, hFont)
 	comboC, _ := syscall.UTF16PtrFromString("COMBOBOX")
-	hComboProfiles, _, _ = procCreateWindow.Call(0x00000200, uintptr(unsafe.Pointer(comboC)), 0, 0x40000000|0x10000000|CBS_DROPDOWNLIST|0x00200000, 15, 35, 230, 200, hwnd, ID_COMBO_PROFILES, 0, 0)
-	procSendMessage.Call(hComboProfiles, WM_SETFONT, hFont, 1)
+	hComboProfiles, _, _ = procCreateWindow.Call(0x00000200, uintptr(unsafe.Pointer(comboC)), 0, 0x40000000|0x10000000|CbsDropdownList|0x00200000, 15, 35, 230, 200, hwnd, IDComboProfiles, 0, 0)
+	procSendMessage.Call(hComboProfiles, WmSetFont, hFont, 1)
 
 	btnC, _ := syscall.UTF16PtrFromString("BUTTON")
 	tAdd, _ := syscall.UTF16PtrFromString("+")
 	tDel, _ := syscall.UTF16PtrFromString("-")
-	hBtnAdd, _, _ = procCreateWindow.Call(0, uintptr(unsafe.Pointer(btnC)), uintptr(unsafe.Pointer(tAdd)), 0x40000000|0x10000000, 255, 34, 30, 25, hwnd, ID_BTN_ADD, 0, 0)
-	hBtnDel, _, _ = procCreateWindow.Call(0, uintptr(unsafe.Pointer(btnC)), uintptr(unsafe.Pointer(tDel)), 0x40000000|0x10000000, 290, 34, 30, 25, hwnd, ID_BTN_DEL, 0, 0)
-	procSendMessage.Call(hBtnAdd, WM_SETFONT, hFont, 1)
-	procSendMessage.Call(hBtnDel, WM_SETFONT, hFont, 1)
+	hBtnAdd, _, _ = procCreateWindow.Call(0, uintptr(unsafe.Pointer(btnC)), uintptr(unsafe.Pointer(tAdd)), 0x40000000|0x10000000, 255, 34, 30, 25, hwnd, IDBtnAdd, 0, 0)
+	hBtnDel, _, _ = procCreateWindow.Call(0, uintptr(unsafe.Pointer(btnC)), uintptr(unsafe.Pointer(tDel)), 0x40000000|0x10000000, 290, 34, 30, 25, hwnd, IDBtnDel, 0, 0)
+	procSendMessage.Call(hBtnAdd, WmSetFont, hFont, 1)
+	procSendMessage.Call(hBtnDel, WmSetFont, hFont, 1)
 
-	// Поля профиля
 	addLabel(hwnd, "Profile Name (Alias):", 15, 75, hFont)
 	hEdName = addEdit(hwnd, "", 15, 95, 315, hFont, 0)
-
 	addLabel(hwnd, "Remote User:", 15, 130, hFont)
 	hEdUser = addEdit(hwnd, "", 15, 150, 315, hFont, 0)
-
 	addLabel(hwnd, "Server Host (IP):", 15, 185, hFont)
 	hEdHost = addEdit(hwnd, "", 15, 205, 315, hFont, 0)
-
 	addLabel(hwnd, "SSH Port:", 15, 240, hFont)
 	hEdSSH = addEdit(hwnd, "", 15, 260, 140, hFont, 0)
-
 	addLabel(hwnd, "SOCKS Port:", 185, 240, hFont)
 	hEdSocks = addEdit(hwnd, "", 185, 260, 145, hFont, 0)
-
 	addLabel(hwnd, "HTTP Port:", 15, 295, hFont)
-	hEdHttp = addEdit(hwnd, "", 15, 315, 140, hFont, 0)
+	hEdHTTP = addEdit(hwnd, "", 15, 315, 140, hFont, 0)
+	addLabel(hwnd, "Bind Address:", 185, 295, hFont)
+	hEdBind = addEdit(hwnd, "", 185, 315, 145, hFont, 0)
 
 	refreshComboBox()
 	loadCurrentProfileToEdits()
 
-	// Глобальные настройки
 	cbT, _ := syscall.UTF16PtrFromString("Auto-connect on startup")
-	hCbAuto, _, _ = procCreateWindow.Call(0, uintptr(unsafe.Pointer(btnC)), uintptr(unsafe.Pointer(cbT)), 0x40000000|0x10000000|0x0003, 15, 355, 315, 25, hwnd, ID_CHECKBOX, 0, 0)
-	procSendMessage.Call(hCbAuto, WM_SETFONT, hFont, 1)
+	hCbAuto, _, _ = procCreateWindow.Call(0, uintptr(unsafe.Pointer(btnC)), uintptr(unsafe.Pointer(cbT)), 0x40000000|0x10000000|0x0003, 15, 375, 315, 25, hwnd, IDCheckbox, 0, 0)
+	procSendMessage.Call(hCbAuto, WmSetFont, hFont, 1)
 	if autoConn {
-		procSendMessage.Call(hCbAuto, BM_SETCHECK, BST_CHECKED, 0)
+		procSendMessage.Call(hCbAuto, BmSetCheck, BstChecked, 0)
 	}
 
 	btnT, _ := syscall.UTF16PtrFromString("Save and Connect")
-	hBtn, _, _ := procCreateWindow.Call(0, uintptr(unsafe.Pointer(btnC)), uintptr(unsafe.Pointer(btnT)), 0x40000000|0x10000000|0x0001, 15, 405, 315, 45, hwnd, ID_BUTTON_SAVE, 0, 0)
-	procSendMessage.Call(hBtn, WM_SETFONT, hFont, 1)
+	hBtn, _, _ := procCreateWindow.Call(0, uintptr(unsafe.Pointer(btnC)), uintptr(unsafe.Pointer(btnT)), 0x40000000|0x10000000|0x0001, 15, 425, 315, 45, hwnd, IDButtonSave, 0, 0)
+	procSendMessage.Call(hBtn, WmSetFont, hFont, 1)
 
 	procShowWindow.Call(hwnd, 1)
 	messageLoop()
@@ -1010,37 +935,30 @@ func showSettingsNative() {
 func showPasswordPrompt() {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-
 	title, _ := syscall.UTF16PtrFromString("Server Password Required")
 	class, _ := syscall.UTF16PtrFromString("SSHPassPrompt")
 	hwnd, _, _ := procCreateWindow.Call(0, uintptr(unsafe.Pointer(class)), uintptr(unsafe.Pointer(title)), 0x00C00000|0x00080000, 300, 300, 350, 180, 0, 0, 0, 0)
-
 	hFont, _, _ := gdi32.NewProc("GetStockObject").Call(17)
 	addLabel(hwnd, "Enter password to install SSH key:", 15, 15, hFont)
-	hPassEdit = addEdit(hwnd, "", 15, 40, 300, hFont, ES_PASSWORD)
-
+	hPassEdit = addEdit(hwnd, "", 15, 40, 300, hFont, EsPassword)
 	btnT, _ := syscall.UTF16PtrFromString("Confirm")
 	btnC, _ := syscall.UTF16PtrFromString("BUTTON")
-	hBtn, _, _ := procCreateWindow.Call(0, uintptr(unsafe.Pointer(btnC)), uintptr(unsafe.Pointer(btnT)), 0x40000000|0x10000000, 15, 80, 300, 40, hwnd, ID_BUTTON_PASS, 0, 0)
-	procSendMessage.Call(hBtn, WM_SETFONT, hFont, 1)
-
+	hBtn, _, _ := procCreateWindow.Call(0, uintptr(unsafe.Pointer(btnC)), uintptr(unsafe.Pointer(btnT)), 0x40000000|0x10000000, 15, 80, 300, 40, hwnd, IDButtonPass, 0, 0)
+	procSendMessage.Call(hBtn, WmSetFont, hFont, 1)
 	procShowWindow.Call(hwnd, 1)
 	messageLoop()
 }
 
-// --- UI Utilities ---
-
 func showError(title, text string) {
 	tPtr, _ := syscall.UTF16PtrFromString(title)
 	txtPtr, _ := syscall.UTF16PtrFromString(text)
-	procMessageBox.Call(0, uintptr(unsafe.Pointer(txtPtr)), uintptr(unsafe.Pointer(tPtr)), 0x00000010) // MB_ICONERROR
+	procMessageBox.Call(0, uintptr(unsafe.Pointer(txtPtr)), uintptr(unsafe.Pointer(tPtr)), 0x00000010)
 }
 
 func registerWindowClass(name string, proc uintptr) {
 	className, _ := syscall.UTF16PtrFromString(name)
 	instance, _, _ := kernel32.NewProc("GetModuleHandleW").Call(0)
 	cursor, _, _ := user32.NewProc("LoadCursorW").Call(0, uintptr(32512))
-
 	type wndClassExW struct {
 		cbSize        uint32
 		style         uint32
@@ -1070,15 +988,14 @@ func addLabel(p uintptr, t string, x, y int, f uintptr) {
 	tP, _ := syscall.UTF16PtrFromString(t)
 	cP, _ := syscall.UTF16PtrFromString("STATIC")
 	h, _, _ := procCreateWindow.Call(0, uintptr(unsafe.Pointer(cP)), uintptr(unsafe.Pointer(tP)), 0x40000000|0x10000000, uintptr(x), uintptr(y), 320, 20, p, 0, 0, 0)
-	procSendMessage.Call(h, WM_SETFONT, f, 1)
+	procSendMessage.Call(h, WmSetFont, f, 1)
 }
 
 func addEdit(p uintptr, t string, x, y, w int, f uintptr, style uint32) uintptr {
 	tP, _ := syscall.UTF16PtrFromString(t)
 	cP, _ := syscall.UTF16PtrFromString("EDIT")
-	// 0x80 = ES_AUTOHSCROLL — горизонтальная прокрутка без ограничений длины
 	h, _, _ := procCreateWindow.Call(0x00000200, uintptr(unsafe.Pointer(cP)), uintptr(unsafe.Pointer(tP)), 0x40000000|0x10000000|0x00800000|uintptr(style)|0x80, uintptr(x), uintptr(y), uintptr(w), 25, p, 0, 0, 0)
-	procSendMessage.Call(h, WM_SETFONT, f, 1)
+	procSendMessage.Call(h, WmSetFont, f, 1)
 	return h
 }
 
@@ -1100,7 +1017,8 @@ func saveEditsToCurrentProfile() {
 		editProfiles[editCurrentIdx].Host = getWinText(hEdHost)
 		editProfiles[editCurrentIdx].SSHPort = getWinText(hEdSSH)
 		editProfiles[editCurrentIdx].SocksPort = getWinText(hEdSocks)
-		editProfiles[editCurrentIdx].HttpPort = getWinText(hEdHttp)
+		editProfiles[editCurrentIdx].HTTPPort = getWinText(hEdHTTP)
+		editProfiles[editCurrentIdx].BindAddress = getWinText(hEdBind)
 	}
 }
 
@@ -1112,25 +1030,27 @@ func loadCurrentProfileToEdits() {
 		setWinText(hEdHost, p.Host)
 		setWinText(hEdSSH, p.SSHPort)
 		setWinText(hEdSocks, p.SocksPort)
-		setWinText(hEdHttp, p.HttpPort)
+		setWinText(hEdHTTP, p.HTTPPort)
+		setWinText(hEdBind, p.BindAddress)
 	} else {
 		setWinText(hEdName, "")
 		setWinText(hEdUser, "")
 		setWinText(hEdHost, "")
 		setWinText(hEdSSH, "")
 		setWinText(hEdSocks, "")
-		setWinText(hEdHttp, "8080")
+		setWinText(hEdHTTP, "8080")
+		setWinText(hEdBind, "127.0.0.1")
 	}
 }
 
 func refreshComboBox() {
-	procSendMessage.Call(hComboProfiles, CB_RESETCONTENT, 0, 0)
+	procSendMessage.Call(hComboProfiles, CbResetContent, 0, 0)
 	for _, p := range editProfiles {
 		ptr, _ := syscall.UTF16PtrFromString(p.Name)
-		procSendMessage.Call(hComboProfiles, CB_ADDSTRING, 0, uintptr(unsafe.Pointer(ptr)))
+		procSendMessage.Call(hComboProfiles, CbAddString, 0, uintptr(unsafe.Pointer(ptr)))
 	}
 	if editCurrentIdx >= 0 && editCurrentIdx < len(editProfiles) {
-		procSendMessage.Call(hComboProfiles, CB_SETCURSEL, uintptr(editCurrentIdx), 0)
+		procSendMessage.Call(hComboProfiles, CbSetCursel, uintptr(editCurrentIdx), 0)
 	}
 }
 
@@ -1217,35 +1137,32 @@ func loadConfig() {
 	} else {
 		conf = Config{AutoConnect: false, Country: "direct"}
 	}
-
-	// Миграция со старого формата (если есть старый Host, но нет Profiles)
 	if len(conf.Profiles) == 0 && conf.Host != "" {
 		newProf := ServerProfile{
-			ID:        fmt.Sprintf("%d", time.Now().UnixNano()),
-			Name:      "Default Server",
-			User:      conf.User,
-			Host:      conf.Host,
-			SSHPort:   conf.SSHPort,
-			SocksPort: conf.SocksPort,
-			HttpPort:  "8080",
+			ID:          fmt.Sprintf("%d", time.Now().UnixNano()),
+			Name:        "Default Server",
+			User:        conf.User,
+			Host:        conf.Host,
+			SSHPort:     conf.SSHPort,
+			SocksPort:   conf.SocksPort,
+			HTTPPort:    "8080",
+			BindAddress: "127.0.0.1",
 		}
 		conf.Profiles = append(conf.Profiles, newProf)
 		conf.ActiveProfileID = newProf.ID
-
-		// Очищаем старые поля
 		conf.Host, conf.User, conf.SSHPort, conf.SocksPort = "", "", "", ""
 		saveConfig()
 	}
-
-	// Миграция: добавить HttpPort в существующие профили, если его нет
 	for i := range conf.Profiles {
-		if conf.Profiles[i].HttpPort == "" {
-			conf.Profiles[i].HttpPort = "8080"
+		if conf.Profiles[i].HTTPPort == "" {
+			conf.Profiles[i].HTTPPort = "8080"
+		}
+		if conf.Profiles[i].BindAddress == "" {
+			conf.Profiles[i].BindAddress = "127.0.0.1"
 		}
 	}
 }
 
-// Вспомогательная функция для получения текущего профиля
 func getActiveProfile() *ServerProfile {
 	for i, p := range conf.Profiles {
 		if p.ID == conf.ActiveProfileID {

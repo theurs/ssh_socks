@@ -13,8 +13,8 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-// HttpProxy represents an HTTP proxy server that forwards through SOCKS5
-type HttpProxy struct {
+// HTTPProxy represents an HTTP proxy server that forwards through SOCKS5
+type HTTPProxy struct {
 	listener  net.Listener
 	socksAddr string // Address of the SOCKS5 proxy (e.g., "127.0.0.1:1080")
 	httpAddr  string // Address to listen for HTTP requests (e.g., "127.0.0.1:8080")
@@ -24,9 +24,9 @@ type HttpProxy struct {
 	mu        sync.Mutex
 }
 
-// NewHttpProxy creates a new HTTP proxy server
-func NewHttpProxy(httpAddr, socksAddr string) *HttpProxy {
-	return &HttpProxy{
+// NewHTTPProxy creates a new HTTP proxy server
+func NewHTTPProxy(httpAddr, socksAddr string) *HTTPProxy {
+	return &HTTPProxy{
 		socksAddr: socksAddr,
 		httpAddr:  httpAddr,
 		stopChan:  make(chan struct{}),
@@ -34,7 +34,7 @@ func NewHttpProxy(httpAddr, socksAddr string) *HttpProxy {
 }
 
 // Start begins listening for HTTP connections
-func (s *HttpProxy) Start() error {
+func (s *HTTPProxy) Start() error {
 	s.mu.Lock()
 	if s.isRunning {
 		s.mu.Unlock()
@@ -80,7 +80,7 @@ func (s *HttpProxy) Start() error {
 }
 
 // Stop gracefully shuts down the HTTP proxy server
-func (s *HttpProxy) Stop() {
+func (s *HTTPProxy) Stop() {
 	s.mu.Lock()
 	if !s.isRunning {
 		s.mu.Unlock()
@@ -98,7 +98,7 @@ func (s *HttpProxy) Stop() {
 }
 
 // handleConnection processes incoming HTTP connections
-func (s *HttpProxy) handleConnection(clientConn net.Conn) {
+func (s *HTTPProxy) handleConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 
 	reader := bufio.NewReader(clientConn)
@@ -116,7 +116,7 @@ func (s *HttpProxy) handleConnection(clientConn net.Conn) {
 }
 
 // handleHTTPS handles HTTPS requests using HTTP CONNECT method
-func (s *HttpProxy) handleHTTPS(clientConn net.Conn, req *http.Request) {
+func (s *HTTPProxy) handleHTTPS(clientConn net.Conn, req *http.Request) {
 	destAddr := req.Host
 
 	// Connect to SOCKS5 proxy
@@ -157,7 +157,7 @@ func (s *HttpProxy) handleHTTPS(clientConn net.Conn, req *http.Request) {
 }
 
 // handleHTTP handles plain HTTP requests (GET, POST, etc.)
-func (s *HttpProxy) handleHTTP(clientConn net.Conn, req *http.Request) {
+func (s *HTTPProxy) handleHTTP(clientConn net.Conn, req *http.Request) {
 	defer clientConn.Close()
 
 	// Extract destination from URL
