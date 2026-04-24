@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"image/png"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,10 +21,12 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 	"unsafe"
 
 	"github.com/getlantern/systray"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/net/proxy"
 )
 
 // --- Structures and Global Variables ---
@@ -44,6 +48,7 @@ type Config struct {
 	AutoConnect      bool            `json:"auto_connect"`
 	Country          string          `json:"country"`
 	HTTPProxyEnabled bool            `json:"http_proxy_enabled"`
+	ReFilterEnabled  bool            `json:"re_filter_enabled"`
 	User             string          `json:"user,omitempty"`
 	Host             string          `json:"host,omitempty"`
 	SSHPort          string          `json:"ssh_port,omitempty"`
@@ -84,12 +89,19 @@ var countryMenuItems = make(map[string]*systray.MenuItem)
 var (
 	conf      Config
 	confMutex sync.Mutex
-	sshCmd    *exec.Cmd
-	stopChan  = make(chan bool, 1)
-	passDone  = make(chan bool, 1)
+
+	filterDomains = make(map[string]struct{})
+	filterIPs     = newIPTrie()
+	filterMutex   sync.RWMutex
+	isListsLoaded bool
+
+	sshCmd   *exec.Cmd
+	stopChan = make(chan bool, 1)
+	passDone = make(chan bool, 1)
 
 	mConnect, mDisconnect *systray.MenuItem
 	mHTTPProxy            *systray.MenuItem
+	mReFilter             *systray.MenuItem
 
 	user32   = syscall.NewLazyDLL("user32.dll")
 	kernel32 = syscall.NewLazyDLL("kernel32.dll")
@@ -129,6 +141,10 @@ var (
 	httpProxyServer *HTTPProxy
 
 	singletonHandle syscall.Handle
+
+	smartSocksListener net.Listener
+
+	logMutex sync.Mutex
 )
 
 const (
@@ -160,7 +176,69 @@ const (
 	IDBtnHTTP       = 7
 )
 
+type trieNode struct {
+	children [2]*trieNode
+	isEnd    bool
+}
+
+type ipTrie struct {
+	v4 *trieNode
+	v6 *trieNode
+}
+
+func newIPTrie() *ipTrie {
+	return &ipTrie{v4: &trieNode{}, v6: &trieNode{}}
+}
+
+func (t *ipTrie) insert(network *net.IPNet) {
+	ip := network.IP
+	ones, _ := network.Mask.Size()
+	node := t.v4
+	if ip.To4() == nil {
+		node = t.v6
+	} else {
+		ip = ip.To4()
+	}
+
+	for i := 0; i < ones; i++ {
+		bit := (ip[i/8] >> (7 - (i % 8))) & 1
+		if node.children[bit] == nil {
+			node.children[bit] = &trieNode{}
+		}
+		node = node.children[bit]
+		if node.isEnd {
+			return // Уже перекрыто более коротким префиксом
+		}
+	}
+	node.isEnd = true
+}
+
+func (t *ipTrie) contains(ip net.IP) bool {
+	node := t.v4
+	if ip.To4() == nil {
+		node = t.v6
+	} else {
+		ip = ip.To4()
+	}
+	if node == nil {
+		return false
+	}
+
+	for i := 0; i < len(ip)*8; i++ {
+		bit := (ip[i/8] >> (7 - (i % 8))) & 1
+		if node.children[bit] == nil {
+			return false
+		}
+		node = node.children[bit]
+		if node.isEnd {
+			return true
+		}
+	}
+	return node.isEnd
+}
+
 func main() {
+	defer handlePanic()
 	runFromTemp()
 
 	if !ensureSingleton() {
@@ -309,6 +387,8 @@ func onReady() {
 
 	systray.AddSeparator()
 	mHTTPProxy = systray.AddMenuItemCheckbox("Enable HTTP Proxy", "Run HTTP proxy on configured port", conf.HTTPProxyEnabled)
+	// Добавляем пункт фильтрации в меню
+	mReFilter = systray.AddMenuItemCheckbox("Re-filter-lists", "Route only specific sites", conf.ReFilterEnabled)
 
 	systray.AddSeparator()
 	mSettings := systray.AddMenuItem("Settings", "Connection parameters")
@@ -319,6 +399,15 @@ func onReady() {
 	registerWindowClass("SSHPassPrompt", syscall.NewCallback(passWndProc))
 
 	setState(StateDisconnected)
+
+	// Если при прошлом запуске фильтрация была включена, начинаем загрузку списков сразу
+	if conf.ReFilterEnabled {
+		go func() {
+			if err := downloadFilterLists(); err != nil {
+				debugLog("[Filters] Startup download failed: %v", err)
+			}
+		}()
+	}
 
 	if conf.AutoConnect && len(conf.Profiles) > 0 {
 		go startSSHLoop()
@@ -334,6 +423,9 @@ func onReady() {
 				setState(StateDisconnected)
 			case <-mHTTPProxy.ClickedCh:
 				handleHTTPProxyToggle()
+			case <-mReFilter.ClickedCh:
+				// Вызываем обработчик включения/выключения фильтра
+				handleReFilterToggle()
 			case <-mSettings.ClickedCh:
 				if !settingsOpen {
 					go showSettingsNative()
@@ -382,6 +474,36 @@ func handleHTTPProxyToggle() {
 				saveConfig()
 			}
 		}
+	}
+}
+
+func handleReFilterToggle() {
+	confMutex.Lock()
+	conf.ReFilterEnabled = !conf.ReFilterEnabled
+	isEnabled := conf.ReFilterEnabled
+	confMutex.Unlock()
+
+	if isEnabled {
+		mReFilter.Check()
+		go downloadFilterLists()
+	} else {
+		mReFilter.Uncheck()
+	}
+	saveConfig()
+
+	loopMutex.Lock()
+	active := loopRunning
+	loopMutex.Unlock()
+
+	if active {
+		debugLog("[Filter] UI Toggle: Restarting connection...")
+		stopSSH()
+
+		go func() {
+			// 1 секунды достаточно для перезапуска
+			time.Sleep(1000 * time.Millisecond)
+			startSSHLoop()
+		}()
 	}
 }
 
@@ -610,6 +732,8 @@ func uploadKeyToServer(pubKey string) error {
 }
 
 func startSSHLoop() {
+	defer handlePanic()
+
 	loopMutex.Lock()
 	if loopRunning {
 		loopMutex.Unlock()
@@ -624,92 +748,137 @@ func startSSHLoop() {
 		loopMutex.Unlock()
 	}()
 
-	select {
-	case <-stopChan:
-	default:
+	// Сбрасываем старые сигналы остановки в канале
+	for len(stopChan) > 0 {
+		<-stopChan
 	}
 
 	confMutex.Lock()
-	prof := getActiveProfile()
-	country := conf.Country
-	if prof != nil {
-		activeRunningProfile = &ServerProfile{}
-		*activeRunningProfile = *prof
-	} else {
-		activeRunningProfile = nil
+	profOrigin := getActiveProfile()
+	if profOrigin == nil || profOrigin.Host == "" {
+		confMutex.Unlock()
+		debugLog("[Loop] Error: No active profile found")
+		setState(StateError)
+		return
 	}
+	// Делаем копию профиля, чтобы изменения в настройках не ломали текущий цикл
+	prof := *profOrigin
+	country := conf.Country
+	filterEnabled := conf.ReFilterEnabled
 	confMutex.Unlock()
 
-	if activeRunningProfile == nil || activeRunningProfile.Host == "" {
-		showError("Profile Error", "No active server.")
-		setState(StateError)
-		return
-	}
-
+	// Обеспечиваем наличие ключей и их доставку на сервер
 	pubKey, err := ensureSSHKeys()
 	if err != nil {
-		showError("Key Error", err.Error())
+		debugLog("[Loop] SSH Key Error: %v", err)
 		setState(StateError)
 		return
 	}
 
-	setState(StateDisconnected)
-	systray.SetTooltip(fmt.Sprintf("Auth: %s...", activeRunningProfile.Name))
+	systray.SetTooltip(fmt.Sprintf("Authenticating: %s...", prof.Name))
 	if err := uploadKeyToServer(pubKey); err != nil {
-		showError("SSH Error", err.Error())
+		debugLog("[Loop] Auth Error: %v", err)
 		setState(StateError)
 		return
 	}
 
 	for {
+		// Проверяем, не пришел ли сигнал на полную остановку
+		select {
+		case <-stopChan:
+			debugLog("[Loop] Stop signal received, exiting.")
+			return
+		default:
+		}
+
+		// Если старый процесс SSH еще жив — убиваем его
 		if sshCmd != nil && sshCmd.Process != nil {
 			sshCmd.Process.Kill()
 		}
-		killProcessOnPort(activeRunningProfile.SocksPort)
-		time.Sleep(500 * time.Millisecond)
 
-		var args []string
-		bindAddr := activeRunningProfile.BindAddress
+		bindAddr := prof.BindAddress
 		if bindAddr == "" {
 			bindAddr = "127.0.0.1"
 		}
 
+		mainSocksPort := prof.SocksPort
+		sshInternalPort := mainSocksPort
+
+		// Настройка портов для режима фильтрации
+		if filterEnabled {
+			var portInt int
+			fmt.Sscanf(mainSocksPort, "%d", &portInt)
+			sshInternalPort = fmt.Sprintf("%d", portInt+1)
+		}
+
+		debugLog("[Loop] Iteration start: Main=%s, SSH_Internal=%s, Filter=%v", mainSocksPort, sshInternalPort, filterEnabled)
+
+		// Очищаем порты от чужих процессов (безопасно для себя)
+		killProcessOnPort(mainSocksPort)
+		if mainSocksPort != sshInternalPort {
+			killProcessOnPort(sshInternalPort)
+		}
+
+		// Короткая пауза для ОС, чтобы освободить сокеты
+		time.Sleep(400 * time.Millisecond)
+
+		var args []string
 		if country == "direct" || country == "" {
-			systray.SetTooltip(fmt.Sprintf("Direct: %s", activeRunningProfile.Name))
-			args = []string{"-N", "-T", "-o", "ServerAliveInterval=60", "-o", "StrictHostKeyChecking=no", "-p", activeRunningProfile.SSHPort, "-D", bindAddr + ":" + activeRunningProfile.SocksPort, fmt.Sprintf("%s@%s", activeRunningProfile.User, activeRunningProfile.Host)}
+			systray.SetTooltip(fmt.Sprintf("Direct: %s", prof.Name))
+			args = []string{"-N", "-T", "-o", "ServerAliveInterval=60", "-o", "StrictHostKeyChecking=no", "-p", prof.SSHPort, "-D", bindAddr + ":" + sshInternalPort, fmt.Sprintf("%s@%s", prof.User, prof.Host)}
 		} else {
-			systray.SetTooltip(fmt.Sprintf("Starting Tor (%s) on %s...", country, activeRunningProfile.Name))
+			systray.SetTooltip(fmt.Sprintf("Tor (%s): %s", country, prof.Name))
 			if err := setupRemoteTor(country); err != nil {
-				showError("Tor Error", err.Error())
+				debugLog("[Loop] Tor Setup Error: %v", err)
 				setState(StateError)
 				return
 			}
-			systray.SetTooltip(fmt.Sprintf("Tor (%s): %s", country, activeRunningProfile.Name))
-			args = []string{"-N", "-T", "-o", "ServerAliveInterval=60", "-o", "StrictHostKeyChecking=no", "-p", activeRunningProfile.SSHPort, "-L", bindAddr + ":" + activeRunningProfile.SocksPort + ":127.0.0.1:9060", fmt.Sprintf("%s@%s", activeRunningProfile.User, activeRunningProfile.Host)}
+			args = []string{"-N", "-T", "-o", "ServerAliveInterval=60", "-o", "StrictHostKeyChecking=no", "-p", prof.SSHPort, "-L", bindAddr + ":" + sshInternalPort + ":127.0.0.1:9060", fmt.Sprintf("%s@%s", prof.User, prof.Host)}
 		}
 
 		sshCmd = exec.Command("ssh", args...)
 		sshCmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 		if err := sshCmd.Start(); err != nil {
+			debugLog("[Loop] SSH Start Failed: %v", err)
 			setState(StateError)
-			return
+			time.Sleep(3 * time.Second)
+			continue
 		}
+
+		// Если включена фильтрация, ждем прогрева туннеля и запускаем прокси-регулировщик
+		if filterEnabled {
+			if waitForPort(bindAddr+":"+sshInternalPort, 15*time.Second) {
+				go startSmartSocksProxy(bindAddr, mainSocksPort, bindAddr+":"+sshInternalPort)
+			} else {
+				debugLog("[Loop] SSH port %s timed out", sshInternalPort)
+				setState(StateError)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+		}
+
 		setState(StateConnected)
 
-		if conf.HTTPProxyEnabled && activeRunningProfile.HTTPPort != "" {
-			socksAddr := net.JoinHostPort(bindAddr, activeRunningProfile.SocksPort)
-			httpAddr := net.JoinHostPort(bindAddr, activeRunningProfile.HTTPPort)
-			httpProxyServer = NewHTTPProxy(httpAddr, socksAddr)
+		// Запуск HTTP прокси, если он включен в меню
+		if conf.HTTPProxyEnabled && prof.HTTPPort != "" {
+			hAddr := net.JoinHostPort(bindAddr, prof.HTTPPort)
+			sAddr := net.JoinHostPort(bindAddr, mainSocksPort)
+			httpProxyServer = NewHTTPProxy(hAddr, sAddr)
 			httpProxyServer.Start()
 		}
 
+		// Ждем либо падения процесса SSH, либо сигнала на выход
 		done := make(chan error, 1)
 		go func() { done <- sshCmd.Wait() }()
+
 		select {
 		case <-stopChan:
+			debugLog("[Loop] Stopping loop.")
 			return
-		case <-done:
+		case err := <-done:
+			debugLog("[Loop] SSH disconnected: %v", err)
 			setState(StateError)
+			// Если соединение разорвалось, ждем 5 секунд и пробуем снова
 			select {
 			case <-stopChan:
 				return
@@ -725,45 +894,80 @@ func stopSSH() {
 	case stopChan <- true:
 	default:
 	}
+
+	filterMutex.Lock()
+	if smartSocksListener != nil {
+		debugLog("[Stop] Closing SmartSocks listener...")
+		smartSocksListener.Close()
+		smartSocksListener = nil
+	}
+	filterMutex.Unlock()
+
 	if httpProxyServer != nil {
 		httpProxyServer.Stop()
 		httpProxyServer = nil
 	}
+
 	if sshCmd != nil && sshCmd.Process != nil {
+		debugLog("[Stop] Killing SSH process...")
 		sshCmd.Process.Kill()
 	}
-	if activeRunningProfile != nil {
-		killProcessOnPort(activeRunningProfile.SocksPort)
-		confMutex.Lock()
-		country := conf.Country
-		confMutex.Unlock()
-		if country != "direct" && country != "" && activeRunningProfile.Host != "" {
-			go func(u, host, port string) {
+
+	confMutex.Lock()
+	prof := getActiveProfile()
+	country := conf.Country
+	confMutex.Unlock()
+
+	if prof != nil {
+		// Очищаем порты (теперь безопасно)
+		killProcessOnPort(prof.SocksPort)
+
+		if country != "direct" && country != "" && prof.Host != "" {
+			go func(u, h, p string) {
 				cleanup := `PID="$HOME/.ssh_proxy_tor.pid"; [ -f "$PID" ] && kill $(cat "$PID") && rm "$PID" || true`
-				c := exec.Command("ssh", "-p", port, "-o", "StrictHostKeyChecking=no", fmt.Sprintf("%s@%s", u, host), cleanup)
+				c := exec.Command("ssh", "-p", p, "-o", "StrictHostKeyChecking=no", fmt.Sprintf("%s@%s", u, h), cleanup)
 				c.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 				c.Run()
-			}(activeRunningProfile.User, activeRunningProfile.Host, activeRunningProfile.SSHPort)
+			}(prof.User, prof.Host, prof.SSHPort)
 		}
-		activeRunningProfile = nil
 	}
 }
 
 func killProcessOnPort(port string) {
+	myPid := os.Getpid()
+
 	cmd := exec.Command("cmd", "/c", fmt.Sprintf("netstat -ano | findstr :%s", port))
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	out, _ := cmd.Output()
 	lines := strings.Split(string(out), "\n")
+
+	// Используем map, чтобы собрать уникальные PID и не спамить
+	pidsToKill := make(map[string]bool)
+
 	for _, line := range lines {
 		fields := strings.Fields(line)
+		// Ищем только строки, где порт указан как прослушиваемый или активный
 		if len(fields) >= 5 && strings.Contains(fields[1], ":"+port) {
-			pid := fields[4]
-			if pid != "0" {
-				kill := exec.Command("taskkill", "/F", "/PID", pid)
-				kill.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-				kill.Run()
+			pidStr := fields[4]
+			if pidStr == "0" || pidStr == "" {
+				continue
+			}
+
+			var pid int
+			fmt.Sscanf(pidStr, "%d", &pid)
+
+			if pid > 0 && pid != myPid {
+				pidsToKill[pidStr] = true
 			}
 		}
+	}
+
+	// Убиваем только чужие процессы и только один раз
+	for pidStr := range pidsToKill {
+		debugLog("[Cleaner] Killing foreign process %s on port %s", pidStr, port)
+		kill := exec.Command("taskkill", "/F", "/PID", pidStr)
+		kill.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		kill.Run()
 	}
 }
 
@@ -1181,4 +1385,428 @@ func saveConfig() {
 	os.MkdirAll(path, 0755)
 	b, _ := json.MarshalIndent(conf, "", "  ")
 	os.WriteFile(filepath.Join(path, "config.json"), b, 0644)
+}
+
+func downloadFilterLists() error {
+	defer handlePanic()
+	debugLog("[Filters] Starting download with Trie and caching...")
+
+	urls := []string{
+		"https://raw.githubusercontent.com/1andrevich/Re-filter-lists/refs/heads/main/domains_all.lst",
+		"https://raw.githubusercontent.com/1andrevich/Re-filter-lists/refs/heads/main/community.lst",
+		"https://raw.githubusercontent.com/1andrevich/Re-filter-lists/refs/heads/main/ipsum.lst",
+		"https://raw.githubusercontent.com/1andrevich/Re-filter-lists/refs/heads/main/community_ips.lst",
+		"https://raw.githubusercontent.com/1andrevich/Re-filter-lists/refs/heads/main/discord_ips.lst",
+	}
+
+	client := &http.Client{
+		Timeout:   45 * time.Second,
+		Transport: &http.Transport{Proxy: nil},
+	}
+
+	newDomains := make(map[string]struct{})
+	newIPTree := newIPTrie()
+	uniqueIPs := make(map[string]struct{}) // Для статистики дубликатов
+
+	for _, url := range urls {
+		fileName := filepath.Base(url)
+		cachePath := getFilterCachePath(fileName)
+
+		var reader io.Reader
+		resp, err := client.Get(url)
+
+		if err == nil && resp.StatusCode == http.StatusOK {
+			bodyBytes, errRead := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if errRead == nil {
+				os.WriteFile(cachePath, bodyBytes, 0644)
+				reader = bytes.NewReader(bodyBytes)
+				debugLog("[Filters] %s downloaded and cached", fileName)
+			}
+		} else {
+			if resp != nil {
+				resp.Body.Close()
+			}
+			cacheData, err := os.ReadFile(cachePath)
+			if err != nil {
+				debugLog("[Filters] Error: %s failed and no cache found", fileName)
+				continue
+			}
+			reader = bytes.NewReader(cacheData)
+			debugLog("[Filters] %s loaded from local cache", fileName)
+		}
+
+		addedInFile := 0
+		rejectedInFile := 0
+		totalInFile := 0
+
+		scanner := bufio.NewScanner(reader)
+		buf := make([]byte, 0, 64*1024)
+		scanner.Buffer(buf, 1024*1024)
+
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			totalInFile++
+
+			if len(line) > 255 {
+				rejectedInFile++
+				continue
+			}
+
+			// Проверка CIDR
+			if _, ipnet, err := net.ParseCIDR(line); err == nil {
+				cidr := ipnet.String()
+				if _, exists := uniqueIPs[cidr]; !exists {
+					uniqueIPs[cidr] = struct{}{}
+					newIPTree.insert(ipnet)
+					addedInFile++
+				} else {
+					rejectedInFile++
+				}
+				continue
+			}
+
+			// Проверка одиночного IP
+			if ip := net.ParseIP(line); ip != nil {
+				mask := 32
+				if ip.To4() == nil {
+					mask = 128
+				}
+				cidr := fmt.Sprintf("%s/%d", line, mask)
+				if _, exists := uniqueIPs[cidr]; !exists {
+					uniqueIPs[cidr] = struct{}{}
+					_, ipnet, _ := net.ParseCIDR(cidr)
+					newIPTree.insert(ipnet)
+					addedInFile++
+				} else {
+					rejectedInFile++
+				}
+				continue
+			}
+
+			// Проверка домена
+			domain := strings.ToLower(line)
+			isValid := true
+			dotCount := 0
+			for _, r := range domain {
+				if r == '.' {
+					dotCount++
+					continue
+				}
+				if r == '-' {
+					continue
+				}
+				if !unicode.IsLetter(r) && !unicode.IsDigit(r) {
+					isValid = false
+					break
+				}
+			}
+
+			if !isValid || dotCount == 0 {
+				rejectedLog("[%s] REJECT | %-30s | Reason: invalid", fileName, line)
+				rejectedInFile++
+			} else {
+				if _, exists := newDomains[domain]; !exists {
+					newDomains[domain] = struct{}{}
+					addedInFile++
+				} else {
+					rejectedInFile++
+				}
+			}
+
+			if len(newDomains)+len(uniqueIPs) > 800000 {
+				debugLog("[Filters] Limit reached.")
+				break
+			}
+		}
+		debugLog("[Filters] File: %-15s | Total: %-6d | Added: %-6d | Rejected: %-6d",
+			fileName, totalInFile, addedInFile, rejectedInFile)
+	}
+
+	filterMutex.Lock()
+	filterDomains = newDomains
+	filterIPs = newIPTree
+	isListsLoaded = true
+	filterMutex.Unlock()
+
+	debugLog("[Filters] Ready. Domains: %d, IPs/Prefixes: %d", len(newDomains), len(uniqueIPs))
+	return nil
+}
+
+func shouldProxy(address string) (bool, string) {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		host = address
+	}
+
+	filterMutex.RLock()
+	defer filterMutex.RUnlock()
+
+	if !isListsLoaded {
+		return false, "lists_not_ready_direct"
+	}
+
+	// 1. Точный домен
+	if _, ok := filterDomains[host]; ok {
+		return true, fmt.Sprintf("exact_domain:%s", host)
+	}
+
+	// 2. Суффиксы/Поддомены
+	parts := strings.Split(host, ".")
+	for i := 0; i < len(parts)-1; i++ {
+		suffix := strings.Join(parts[i:], ".")
+		if _, ok := filterDomains[suffix]; ok {
+			return true, fmt.Sprintf("suffix_match:%s(via_%s)", host, suffix)
+		}
+	}
+
+	// 3. IP через Trie
+	ip := net.ParseIP(host)
+	if ip != nil {
+		if filterIPs.contains(ip) {
+			return true, fmt.Sprintf("ip_trie_match:%s", host)
+		}
+	}
+
+	return false, ""
+}
+
+func startSmartSocksProxy(bindAddr, listenPort, sshSocksAddr string) {
+	// 1. Ловушка для паник (запишет причину в crash.log если упадет)
+	defer handlePanic()
+
+	var l net.Listener
+	var err error
+
+	// 2. Попытки занять порт (защита от "Address already in use")
+	for i := 0; i < 5; i++ {
+		l, err = net.Listen("tcp", bindAddr+":"+listenPort)
+		if err == nil {
+			break
+		}
+		debugLog("[SmartSocks] Port %s busy, retry %d/5...", listenPort, i+1)
+		time.Sleep(1 * time.Second)
+	}
+
+	if err != nil {
+		debugLog("[SmartSocks] CRITICAL: FAILED to listen on %s: %v", listenPort, err)
+		return
+	}
+
+	// 3. Сохраняем листенер в глобальную переменную под замком для stopSSH
+	filterMutex.Lock()
+	smartSocksListener = l
+	filterMutex.Unlock()
+
+	debugLog("[SmartSocks] UP and running on %s. Target SSH: %s", listenPort, sshSocksAddr)
+
+	for {
+		client, err := l.Accept()
+		if err != nil {
+			// Если листенер закрыт через l.Close() в stopSSH, Accept вернет ошибку.
+			// Это нормальный способ остановить цикл.
+			debugLog("[SmartSocks] Accept loop stopped (listener closed)")
+			return
+		}
+
+		go func(c net.Conn) {
+			// В каждой горутине тоже нужна защита от паник
+			defer handlePanic()
+			defer c.Close()
+
+			// --- SOCKS5 Handshake ---
+			buf := make([]byte, 256)
+			// Читаем версию и кол-во методов
+			if _, err := io.ReadFull(c, buf[:2]); err != nil {
+				return
+			}
+			if buf[0] != 0x05 { // Только SOCKS5
+				return
+			}
+
+			nMethods := int(buf[1])
+			if _, err := io.ReadFull(c, buf[:nMethods]); err != nil {
+				return
+			}
+			// Отвечаем: версия 5, аутентификация не требуется
+			c.Write([]byte{0x05, 0x00})
+
+			// --- Read Request ---
+			if _, err := io.ReadFull(c, buf[:4]); err != nil {
+				return
+			}
+			// buf[1] - команда (0x01 = CONNECT)
+			// buf[3] - тип адреса (0x01=IPv4, 0x03=Domain, 0x04=IPv6)
+
+			var host string
+			switch buf[3] {
+			case 0x01: // IPv4
+				if _, err := io.ReadFull(c, buf[:4]); err != nil {
+					return
+				}
+				host = net.IP(buf[:4]).String()
+			case 0x03: // Domain
+				if _, err := io.ReadFull(c, buf[:1]); err != nil {
+					return
+				}
+				sz := int(buf[0])
+				if _, err := io.ReadFull(c, buf[:sz]); err != nil {
+					return
+				}
+				host = string(buf[:sz])
+			case 0x04: // IPv6
+				if _, err := io.ReadFull(c, buf[:16]); err != nil {
+					return
+				}
+				host = net.IP(buf[:16]).String()
+			default:
+				debugLog("[SmartSocks] Unknown address type: %d", buf[3])
+				return
+			}
+
+			// Читаем порт (2 байта)
+			if _, err := io.ReadFull(c, buf[:2]); err != nil {
+				return
+			}
+			port := binary.BigEndian.Uint16(buf[:2])
+			address := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+
+			// --- Routing decision ---
+			shouldUseProxy, reason := shouldProxy(address)
+
+			var target net.Conn
+			if shouldUseProxy {
+				// Логируем в proxy.log
+				proxyLog("[SOCKS5] PROXY | %-30s | Reason: %s", address, reason)
+
+				// Подключаемся к SSH-туннелю
+				baseDialer := &net.Dialer{Timeout: 10 * time.Second}
+				dialer, errDialer := proxy.SOCKS5("tcp", sshSocksAddr, nil, baseDialer)
+				if errDialer != nil {
+					debugLog("[SmartSocks] Dialer Error: %v", errDialer)
+					return
+				}
+				target, err = dialer.Dial("tcp", address)
+			} else {
+				// Прямое соединение (без логирования в proxy.log)
+				target, err = net.DialTimeout("tcp", address, 10*time.Second)
+			}
+
+			if err != nil {
+				debugLog("[SmartSocks] Connection failed to %s: %v", address, err)
+				// Отправляем клиенту General SOCKS server failure (0x01)
+				c.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+				return
+			}
+			defer target.Close()
+
+			// Отправляем ответ об успешном соединении
+			c.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+
+			// --- Data Relay (Pipe) ---
+			// Релей с защитой от зомби-горутин (взаимное закрытие через дедлайны)
+			relay := func(dst, src net.Conn) {
+				defer handlePanic()
+				io.Copy(dst, src)
+				dst.SetDeadline(time.Now())
+				src.SetDeadline(time.Now())
+			}
+
+			go relay(target, c)
+			relay(c, target)
+		}(client)
+	}
+}
+
+func waitForPort(addr string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			return true
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	return false
+}
+
+func getFilterCachePath(filename string) string {
+	dir, _ := os.UserConfigDir()
+	path := filepath.Join(dir, "ssh-socks-tray", "filters")
+	os.MkdirAll(path, 0755)
+	return filepath.Join(path, filename+".cache")
+}
+
+// getLogPath возвращает полный путь к файлу лога в папке AppData
+func getLogPath(filename string) string {
+	dir, _ := os.UserConfigDir()
+	path := filepath.Join(dir, "ssh-socks-tray", "logs")
+	os.MkdirAll(path, 0755)
+	return filepath.Join(path, filename)
+}
+
+// writeLog записывает сообщение в файл, ограничивая его размер
+func writeLog(filename string, message string) {
+	logMutex.Lock()
+	defer logMutex.Unlock()
+
+	path := getLogPath(filename)
+	maxSize := int64(5 * 1024 * 1024) // 5 МБ
+
+	if info, err := os.Stat(path); err == nil {
+		if info.Size() > maxSize {
+			os.WriteFile(path, []byte("--- Log truncated (size limit reached) ---\n"), 0644)
+		}
+	}
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	timestamp := time.Now().Format("2006/01/02 15:04:05")
+	f.WriteString(timestamp + " " + message + "\n")
+}
+
+func rejectedLog(format string, v ...interface{}) {
+	msg := fmt.Sprintf(format, v...)
+	writeLog("rejected.log", msg)
+}
+
+func debugLog(format string, v ...interface{}) {
+	msg := fmt.Sprintf(format, v...)
+	writeLog("debug.log", msg)
+}
+
+func proxyLog(format string, v ...interface{}) {
+	msg := fmt.Sprintf(format, v...)
+	writeLog("proxy.log", msg)
+}
+
+func handlePanic() {
+	if r := recover(); r != nil {
+		path := getLogPath("crash.log")
+		f, _ := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		defer f.Close()
+
+		fmt.Fprintf(f, "\n=== CRASH AT %s ===\n", time.Now().Format("2006-01-02 15:04:05"))
+		fmt.Fprintf(f, "Panic: %v\n\n", r)
+
+		buf := make([]byte, 2048)
+		for {
+			n := runtime.Stack(buf, true)
+			if n < len(buf) {
+				f.Write(buf[:n])
+				break
+			}
+			buf = make([]byte, len(buf)*2)
+		}
+		f.WriteString("\n========================\n")
+		os.Exit(1)
+	}
 }

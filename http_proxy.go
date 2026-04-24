@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/net/proxy"
 )
@@ -115,55 +116,61 @@ func (s *HTTPProxy) handleConnection(clientConn net.Conn) {
 	}
 }
 
-// handleHTTPS handles HTTPS requests using HTTP CONNECT method
 func (s *HTTPProxy) handleHTTPS(clientConn net.Conn, req *http.Request) {
 	destAddr := req.Host
 
-	// Connect to SOCKS5 proxy
-	socksDialer, err := proxy.SOCKS5("tcp", s.socksAddr, nil, proxy.Direct)
-	if err != nil {
-		log.Printf("[HTTP Proxy] SOCKS5 dialer error: %v", err)
-		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-		return
+	var targetConn net.Conn
+	var err error
+
+	// Проверяем, нужно ли фильтровать этот адрес
+	shouldUseProxy, reason := shouldProxy(destAddr)
+
+	if shouldUseProxy {
+		// Логируем в отдельный файл
+		proxyLog("[HTTP-S] PROXY | %-30s | Reason: %s", destAddr, reason)
+
+		// Соединяемся через SOCKS5 туннель (на порт 1080 или 1081)
+		socksDialer, errDialer := proxy.SOCKS5("tcp", s.socksAddr, nil, proxy.Direct)
+		if errDialer != nil {
+			log.Printf("[HTTP Proxy] SOCKS5 dialer error: %v", errDialer)
+			clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+			return
+		}
+		targetConn, err = socksDialer.Dial("tcp", destAddr)
+	} else {
+		// Соединяемся напрямую
+		targetConn, err = net.DialTimeout("tcp", destAddr, 10*time.Second)
 	}
 
-	// Connect to destination through SOCKS5
-	targetConn, err := socksDialer.Dial("tcp", destAddr)
 	if err != nil {
-		log.Printf("[HTTP Proxy] Target connection error: %v", err)
+		log.Printf("[HTTP Proxy] Target connection error to %s: %v", destAddr, err)
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
 	defer targetConn.Close()
 
-	// Tell client connection is established
-	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-
-	// Bidirectional copy
-	done := make(chan struct{}, 2)
-	go func() {
-		io.Copy(targetConn, clientConn)
-		done <- struct{}{}
-	}()
-	go func() {
-		io.Copy(clientConn, targetConn)
-		done <- struct{}{}
-	}()
-
-	select {
-	case <-done:
-	case <-s.stopChan:
+	// Подтверждаем установку туннеля клиенту
+	_, err = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	if err != nil {
+		return
 	}
+
+	// Копируем данные в обе стороны с защитой от зомби-горутин
+	relay := func(dst, src net.Conn) {
+		io.Copy(dst, src)
+		dst.SetDeadline(time.Now())
+		src.SetDeadline(time.Now())
+	}
+
+	go relay(targetConn, clientConn)
+	relay(clientConn, targetConn)
 }
 
-// handleHTTP handles plain HTTP requests (GET, POST, etc.)
 func (s *HTTPProxy) handleHTTP(clientConn net.Conn, req *http.Request) {
 	defer clientConn.Close()
 
-	// Extract destination from URL
 	destAddr := req.URL.Host
 	if destAddr == "" {
-		// If URL doesn't have host, try to parse from full URL
 		if !strings.HasPrefix(req.URL.String(), "http") {
 			req.URL.Host = req.Host
 			req.URL.Scheme = "http"
@@ -176,36 +183,47 @@ func (s *HTTPProxy) handleHTTP(clientConn net.Conn, req *http.Request) {
 		return
 	}
 
-	// Connect to SOCKS5 proxy
-	socksDialer, err := proxy.SOCKS5("tcp", s.socksAddr, nil, proxy.Direct)
-	if err != nil {
-		log.Printf("[HTTP Proxy] SOCKS5 dialer error: %v", err)
-		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 13\r\n\r\n502 Bad Gateway"))
-		return
+	var targetConn net.Conn
+	var err error
+
+	// Решаем: туннель или прямой выход
+	shouldUseProxy, reason := shouldProxy(destAddr)
+
+	if shouldUseProxy {
+		// Логируем проксирование
+		proxyLog("[HTTP  ] PROXY | %-30s | Reason: %s", destAddr, reason)
+
+		socksDialer, errDialer := proxy.SOCKS5("tcp", s.socksAddr, nil, proxy.Direct)
+		if errDialer != nil {
+			log.Printf("[HTTP Proxy] SOCKS5 dialer error: %v", errDialer)
+			clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 13\r\n\r\n502 Bad Gateway"))
+			return
+		}
+		targetConn, err = socksDialer.Dial("tcp", destAddr)
+	} else {
+		// Прямое соединение
+		targetConn, err = net.DialTimeout("tcp", destAddr, 10*time.Second)
 	}
 
-	// Connect to destination through SOCKS5
-	targetConn, err := socksDialer.Dial("tcp", destAddr)
 	if err != nil {
-		log.Printf("[HTTP Proxy] Target connection error: %v", err)
+		log.Printf("[HTTP Proxy] Target connection error to %s: %v", destAddr, err)
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 13\r\n\r\n502 Bad Gateway"))
 		return
 	}
 	defer targetConn.Close()
 
-	// Rewrite request to be proper HTTP/1.1
+	// Переписываем запрос для передачи серверу
 	req.URL.Scheme = "http"
 	req.RequestURI = ""
 	req.Host = destAddr
 
-	// Forward request
 	err = req.Write(targetConn)
 	if err != nil {
 		log.Printf("[HTTP Proxy] Error forwarding request: %v", err)
 		return
 	}
 
-	// Read response from target
+	// Читаем и пересылаем ответ
 	reader := bufio.NewReader(targetConn)
 	resp, err := http.ReadResponse(reader, req)
 	if err != nil {
@@ -213,10 +231,15 @@ func (s *HTTPProxy) handleHTTP(clientConn net.Conn, req *http.Request) {
 		return
 	}
 
-	// Forward response to client
 	err = resp.Write(clientConn)
 	if err != nil {
 		log.Printf("[HTTP Proxy] Error writing response: %v", err)
 		return
+	}
+
+	// Принудительное завершение для предотвращения висячих Keep-Alive горутин
+	if resp.Close || req.Close {
+		targetConn.SetDeadline(time.Now())
+		clientConn.SetDeadline(time.Now())
 	}
 }
