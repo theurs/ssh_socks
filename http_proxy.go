@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -20,7 +19,6 @@ type HTTPProxy struct {
 	socksAddr string // Address of the SOCKS5 proxy (e.g., "127.0.0.1:1080")
 	httpAddr  string // Address to listen for HTTP requests (e.g., "127.0.0.1:8080")
 	stopChan  chan struct{}
-	wg        sync.WaitGroup
 	isRunning bool
 	mu        sync.Mutex
 }
@@ -53,11 +51,9 @@ func (s *HTTPProxy) Start() error {
 	s.isRunning = true
 	s.mu.Unlock()
 
-	log.Printf("[HTTP Proxy] Starting on %s (forwarding to SOCKS5 %s)", s.httpAddr, s.socksAddr)
+	debugLog("[HTTP Proxy] Starting on %s (forwarding to SOCKS5 %s)", s.httpAddr, s.socksAddr)
 
-	s.wg.Add(1)
 	go func() {
-		defer s.wg.Done()
 		for {
 			conn, err := s.listener.Accept()
 			if err != nil {
@@ -65,13 +61,11 @@ func (s *HTTPProxy) Start() error {
 				case <-s.stopChan:
 					return
 				default:
-					log.Printf("[HTTP Proxy] Accept error: %v", err)
+					debugLog("[HTTP Proxy] Accept error: %v", err)
 					continue
 				}
 			}
-			s.wg.Add(1)
 			go func(c net.Conn) {
-				defer s.wg.Done()
 				s.handleConnection(c)
 			}(conn)
 		}
@@ -94,8 +88,7 @@ func (s *HTTPProxy) Stop() {
 	if s.listener != nil {
 		s.listener.Close()
 	}
-	s.wg.Wait()
-	log.Printf("[HTTP Proxy] Stopped")
+	debugLog("[HTTP Proxy] Stopped")
 }
 
 // handleConnection processes incoming HTTP connections
@@ -105,18 +98,17 @@ func (s *HTTPProxy) handleConnection(clientConn net.Conn) {
 	reader := bufio.NewReader(clientConn)
 	req, err := http.ReadRequest(reader)
 	if err != nil {
-		log.Printf("[HTTP Proxy] Error reading request: %v", err)
 		return
 	}
 
 	if req.Method == http.MethodConnect {
-		s.handleHTTPS(clientConn, req)
+		s.handleHTTPS(clientConn, reader, req)
 	} else {
-		s.handleHTTP(clientConn, req)
+		s.handleHTTP(clientConn, reader, req)
 	}
 }
 
-func (s *HTTPProxy) handleHTTPS(clientConn net.Conn, req *http.Request) {
+func (s *HTTPProxy) handleHTTPS(clientConn net.Conn, reader *bufio.Reader, req *http.Request) {
 	destAddr := req.Host
 
 	var targetConn net.Conn
@@ -132,7 +124,7 @@ func (s *HTTPProxy) handleHTTPS(clientConn net.Conn, req *http.Request) {
 		// Соединяемся через SOCKS5 туннель (на порт 1080 или 1081)
 		socksDialer, errDialer := proxy.SOCKS5("tcp", s.socksAddr, nil, proxy.Direct)
 		if errDialer != nil {
-			log.Printf("[HTTP Proxy] SOCKS5 dialer error: %v", errDialer)
+			debugLog("[HTTP Proxy] SOCKS5 dialer error: %v", errDialer)
 			clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 			return
 		}
@@ -143,7 +135,7 @@ func (s *HTTPProxy) handleHTTPS(clientConn net.Conn, req *http.Request) {
 	}
 
 	if err != nil {
-		log.Printf("[HTTP Proxy] Target connection error to %s: %v", destAddr, err)
+		debugLog("[HTTP Proxy] Target connection error to %s: %v", destAddr, err)
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
@@ -155,20 +147,11 @@ func (s *HTTPProxy) handleHTTPS(clientConn net.Conn, req *http.Request) {
 		return
 	}
 
-	// Копируем данные в обе стороны с защитой от зомби-горутин
-	relay := func(dst, src net.Conn) {
-		io.Copy(dst, src)
-		dst.SetDeadline(time.Now())
-		src.SetDeadline(time.Now())
-	}
-
-	go relay(targetConn, clientConn)
-	relay(clientConn, targetConn)
+	// Переходим в режим прозрачного моста
+	s.bridge(clientConn, targetConn, reader)
 }
 
-func (s *HTTPProxy) handleHTTP(clientConn net.Conn, req *http.Request) {
-	defer clientConn.Close()
-
+func (s *HTTPProxy) handleHTTP(clientConn net.Conn, reader *bufio.Reader, req *http.Request) {
 	destAddr := req.URL.Host
 	if destAddr == "" {
 		if !strings.HasPrefix(req.URL.String(), "http") {
@@ -195,7 +178,7 @@ func (s *HTTPProxy) handleHTTP(clientConn net.Conn, req *http.Request) {
 
 		socksDialer, errDialer := proxy.SOCKS5("tcp", s.socksAddr, nil, proxy.Direct)
 		if errDialer != nil {
-			log.Printf("[HTTP Proxy] SOCKS5 dialer error: %v", errDialer)
+			debugLog("[HTTP Proxy] SOCKS5 dialer error: %v", errDialer)
 			clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 13\r\n\r\n502 Bad Gateway"))
 			return
 		}
@@ -206,7 +189,7 @@ func (s *HTTPProxy) handleHTTP(clientConn net.Conn, req *http.Request) {
 	}
 
 	if err != nil {
-		log.Printf("[HTTP Proxy] Target connection error to %s: %v", destAddr, err)
+		debugLog("[HTTP Proxy] Target connection error to %s: %v", destAddr, err)
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 13\r\n\r\n502 Bad Gateway"))
 		return
 	}
@@ -219,27 +202,29 @@ func (s *HTTPProxy) handleHTTP(clientConn net.Conn, req *http.Request) {
 
 	err = req.Write(targetConn)
 	if err != nil {
-		log.Printf("[HTTP Proxy] Error forwarding request: %v", err)
+		debugLog("[HTTP Proxy] Error forwarding request: %v", err)
 		return
 	}
 
-	// Читаем и пересылаем ответ
-	reader := bufio.NewReader(targetConn)
-	resp, err := http.ReadResponse(reader, req)
-	if err != nil {
-		log.Printf("[HTTP Proxy] Error reading response: %v", err)
-		return
+	// Переходим в режим прозрачного моста для последующих данных (Keep-Alive)
+	s.bridge(clientConn, targetConn, reader)
+}
+
+// bridge организует надежную двустороннюю перекачку данных
+func (s *HTTPProxy) bridge(client, target net.Conn, clientReader io.Reader) {
+	var once sync.Once
+	closeFunc := func() {
+		client.Close()
+		target.Close()
 	}
 
-	err = resp.Write(clientConn)
-	if err != nil {
-		log.Printf("[HTTP Proxy] Error writing response: %v", err)
-		return
-	}
+	// Направление: Клиент -> Сервер
+	go func() {
+		io.Copy(target, clientReader)
+		once.Do(closeFunc)
+	}()
 
-	// Принудительное завершение для предотвращения висячих Keep-Alive горутин
-	if resp.Close || req.Close {
-		targetConn.SetDeadline(time.Now())
-		clientConn.SetDeadline(time.Now())
-	}
+	// Направление: Сервер -> Клиент
+	io.Copy(client, target)
+	once.Do(closeFunc)
 }

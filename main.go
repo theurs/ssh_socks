@@ -419,19 +419,21 @@ func onReady() {
 			case <-mConnect.ClickedCh:
 				go startSSHLoop()
 			case <-mDisconnect.ClickedCh:
-				stopSSH()
-				setState(StateDisconnected)
+				go func() {
+					stopSSH()
+					setState(StateDisconnected)
+				}()
 			case <-mHTTPProxy.ClickedCh:
-				handleHTTPProxyToggle()
+				go handleHTTPProxyToggle()
 			case <-mReFilter.ClickedCh:
 				// Вызываем обработчик включения/выключения фильтра
-				handleReFilterToggle()
+				go handleReFilterToggle()
 			case <-mSettings.ClickedCh:
 				if !settingsOpen {
 					go showSettingsNative()
 				}
 			case <-mQuit.ClickedCh:
-				systray.Quit()
+				go onExit()
 				return
 			}
 		}
@@ -441,6 +443,7 @@ func onReady() {
 func onExit() {
 	stopSSH()
 	closeSingleton()
+	os.Exit(0) // Принудительный выход из процесса
 }
 
 func handleHTTPProxyToggle() {
@@ -491,20 +494,24 @@ func handleReFilterToggle() {
 	}
 	saveConfig()
 
-	loopMutex.Lock()
-	active := loopRunning
-	loopMutex.Unlock()
+	// Полная остановка текущих процессов
+	stopSSH()
 
-	if active {
+	// Ждем сброса флага loopRunning в горутине, чтобы избежать гонки "Already running"
+	go func() {
+		// Ограничиваем ожидание 2 секундами
+		for i := 0; i < 20; i++ {
+			loopMutex.Lock()
+			running := loopRunning
+			loopMutex.Unlock()
+			if !running {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
 		debugLog("[Filter] UI Toggle: Restarting connection...")
-		stopSSH()
-
-		go func() {
-			// 1 секунды достаточно для перезапуска
-			time.Sleep(1000 * time.Millisecond)
-			startSSHLoop()
-		}()
-	}
+		startSSHLoop()
+	}()
 }
 
 func rebuildServersMenu() {
@@ -737,6 +744,7 @@ func startSSHLoop() {
 	loopMutex.Lock()
 	if loopRunning {
 		loopMutex.Unlock()
+		debugLog("[Loop] Already running, skip start")
 		return
 	}
 	loopRunning = true
@@ -748,7 +756,7 @@ func startSSHLoop() {
 		loopMutex.Unlock()
 	}()
 
-	// Сбрасываем старые сигналы остановки в канале
+	// Очищаем канал от старых сигналов остановки
 	for len(stopChan) > 0 {
 		<-stopChan
 	}
@@ -761,13 +769,14 @@ func startSSHLoop() {
 		setState(StateError)
 		return
 	}
-	// Делаем копию профиля, чтобы изменения в настройках не ломали текущий цикл
+
+	activeRunningProfile = profOrigin // Обновляем активный профиль для HTTP прокси
+
 	prof := *profOrigin
 	country := conf.Country
 	filterEnabled := conf.ReFilterEnabled
 	confMutex.Unlock()
 
-	// Обеспечиваем наличие ключей и их доставку на сервер
 	pubKey, err := ensureSSHKeys()
 	if err != nil {
 		debugLog("[Loop] SSH Key Error: %v", err)
@@ -783,15 +792,13 @@ func startSSHLoop() {
 	}
 
 	for {
-		// Проверяем, не пришел ли сигнал на полную остановку
 		select {
 		case <-stopChan:
-			debugLog("[Loop] Stop signal received, exiting.")
+			debugLog("[Loop] Stop signal, exiting loop")
 			return
 		default:
 		}
 
-		// Если старый процесс SSH еще жив — убиваем его
 		if sshCmd != nil && sshCmd.Process != nil {
 			sshCmd.Process.Kill()
 		}
@@ -804,11 +811,17 @@ func startSSHLoop() {
 		mainSocksPort := prof.SocksPort
 		sshInternalPort := mainSocksPort
 
-		// Настройка портов для режима фильтрации
+		// Динамический выбор внутреннего порта SSH, чтобы не занять HTTP порт
 		if filterEnabled {
-			var portInt int
-			fmt.Sscanf(mainSocksPort, "%d", &portInt)
-			sshInternalPort = fmt.Sprintf("%d", portInt+1)
+			var socksP, httpP int
+			fmt.Sscanf(mainSocksPort, "%d", &socksP)
+			fmt.Sscanf(prof.HTTPPort, "%d", &httpP)
+
+			candidate := socksP + 1
+			if candidate == httpP {
+				candidate++
+			}
+			sshInternalPort = fmt.Sprintf("%d", candidate)
 		}
 
 		debugLog("[Loop] Iteration start: Main=%s, SSH_Internal=%s, Filter=%v", mainSocksPort, sshInternalPort, filterEnabled)
@@ -839,7 +852,6 @@ func startSSHLoop() {
 		sshCmd = exec.Command("ssh", args...)
 		sshCmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 		if err := sshCmd.Start(); err != nil {
-			debugLog("[Loop] SSH Start Failed: %v", err)
 			setState(StateError)
 			time.Sleep(3 * time.Second)
 			continue
@@ -850,7 +862,6 @@ func startSSHLoop() {
 			if waitForPort(bindAddr+":"+sshInternalPort, 15*time.Second) {
 				go startSmartSocksProxy(bindAddr, mainSocksPort, bindAddr+":"+sshInternalPort)
 			} else {
-				debugLog("[Loop] SSH port %s timed out", sshInternalPort)
 				setState(StateError)
 				time.Sleep(2 * time.Second)
 				continue
@@ -859,8 +870,17 @@ func startSSHLoop() {
 
 		setState(StateConnected)
 
-		// Запуск HTTP прокси, если он включен в меню
-		if conf.HTTPProxyEnabled && prof.HTTPPort != "" {
+		// Перезапуск HTTP прокси при каждой итерации туннеля
+		if httpProxyServer != nil {
+			httpProxyServer.Stop()
+			httpProxyServer = nil
+		}
+
+		confMutex.Lock()
+		httpEnabled := conf.HTTPProxyEnabled
+		confMutex.Unlock()
+
+		if httpEnabled && prof.HTTPPort != "" {
 			hAddr := net.JoinHostPort(bindAddr, prof.HTTPPort)
 			sAddr := net.JoinHostPort(bindAddr, mainSocksPort)
 			httpProxyServer = NewHTTPProxy(hAddr, sAddr)
@@ -873,10 +893,8 @@ func startSSHLoop() {
 
 		select {
 		case <-stopChan:
-			debugLog("[Loop] Stopping loop.")
 			return
-		case err := <-done:
-			debugLog("[Loop] SSH disconnected: %v", err)
+		case <-done:
 			setState(StateError)
 			// Если соединение разорвалось, ждем 5 секунд и пробуем снова
 			select {
@@ -1542,11 +1560,22 @@ func shouldProxy(address string) (bool, string) {
 		host = address
 	}
 
+	confMutex.Lock()
+	filterEnabled := conf.ReFilterEnabled
+	confMutex.Unlock()
+
+	// Если фильтрация отключена — безусловно проксируем всё через туннель
+	if !filterEnabled {
+		return true, "filter_off_proxy_all"
+	}
+
 	filterMutex.RLock()
 	defer filterMutex.RUnlock()
 
+	// Если фильтрация ВКЛ, но списки еще не загружены —
+	// проксируем всё, чтобы не было "обрыва" интернета на старте
 	if !isListsLoaded {
-		return false, "lists_not_ready_direct"
+		return true, "lists_loading_proxy_all"
 	}
 
 	// 1. Точный домен
